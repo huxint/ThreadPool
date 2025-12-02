@@ -12,7 +12,6 @@
 enum class TaskPriority : std::uint8_t { High = 0, Normal = 1, Low = 2 };
 
 class ThreadPool {
-private:
     // 任务类型：(优先级, 序列号, 任务函数)
     struct PriorityTask {
         TaskPriority priority;
@@ -80,7 +79,7 @@ private:
 inline ThreadPool::ThreadPool(std::size_t thread_count)
 : task_sequence_(0),
   running_(true) {
-    thread_count = std::max(thread_count, std::size_t(1)); // 至少有一个线程
+    thread_count = std::max(thread_count, static_cast<std::size_t>(1)); // 至少有一个线程
     workers_.reserve(thread_count);
     for (std::size_t i = 0; i < thread_count; ++i) {
         workers_.emplace_back(&ThreadPool::worker_loop, this);
@@ -136,10 +135,10 @@ inline void ThreadPool::worker_loop() {
     while (true) {
         std::move_only_function<void()> task;
         {
-            std::unique_lock<std::mutex> lock(tasks_mutex_);
+            std::unique_lock lock(tasks_mutex_);
 
             // 等待任务队列不为空或线程池停止运行
-            tasks_condition_.wait(lock, [this]() {
+            tasks_condition_.wait(lock, [this] {
                 return !tasks_.empty() || !running();
             });
 
