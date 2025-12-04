@@ -1,7 +1,9 @@
 #pragma once
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <functional>
 #include <future>
 #include <memory>
@@ -188,7 +190,13 @@ inline void ThreadPool::worker_loop() {
         }
         // 执行任务
         task();
-        --active_tasks_;
-        idle_condition_.notify_all(); // 通知 wait_idle
+        {
+            std::scoped_lock lock(tasks_mutex_);
+            --active_tasks_;
+            // 当队列为空且没有正在执行的任务时唤醒 wait_idle
+            if (tasks_.empty() && active_tasks_.load() == 0) {
+                idle_condition_.notify_all();
+            }
+        }
     }
 }
