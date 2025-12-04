@@ -1,4 +1,5 @@
 #pragma once
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -50,15 +51,16 @@ public:
 
     // 获取线程池中的线程数量
     std::size_t thread_count() const noexcept {
-        return workers_.size();
+        return thread_count_;
     }
 
-    // 获取队列中待处理任务的数量
-    std::size_t pending_task_count() const noexcept {
-        std::scoped_lock lock(tasks_mutex_);
-        return tasks_.size();
-    }
+    // 等待所有任务执行完毕(不可在线程中调用)
+    void wait_idle();
 
+    // 重启线程池(不可在线程中调用)
+    void launch();
+
+    // 关闭线程池(不可在线程中调用)
     void shutdown() noexcept;
 
     // 判断线程池是否运行
@@ -70,18 +72,22 @@ private:
     void worker_loop();                                                                  // 工作线程主循环
     mutable std::mutex tasks_mutex_;                                                     // 任务队列的互斥锁
     std::condition_variable tasks_condition_;                                            // 任务队列的条件变量
+    std::condition_variable idle_condition_;                                             // 空闲等待的条件变量
     std::vector<std::thread> workers_;                                                   // 线程池中的线程
     std::priority_queue<PriorityTask, std::vector<PriorityTask>, std::greater<>> tasks_; // 任务队列
-    std::uint64_t task_sequence_;                                                        // 任务序列号
+    std::atomic<std::uint64_t> active_tasks_;                                            // 正在执行的任务数
+    std::atomic<std::uint64_t> task_sequence_;                                           // 任务序列号
+    std::size_t thread_count_;                                                           // 线程池中的线程数量
     std::atomic<bool> running_;                                                          // 线程池是否运行
 };
 
 inline ThreadPool::ThreadPool(std::size_t thread_count)
-: task_sequence_(0),
+: active_tasks_(0),
+  task_sequence_(0),
+  thread_count_(std::max(thread_count, static_cast<std::size_t>(1))), // 至少有一个线程
   running_(true) {
-    thread_count = std::max(thread_count, static_cast<std::size_t>(1)); // 至少有一个线程
-    workers_.reserve(thread_count);
-    for (std::size_t i = 0; i < thread_count; ++i) {
+    workers_.reserve(thread_count_);
+    for (std::size_t i = 0; i < thread_count_; ++i) {
         workers_.emplace_back(&ThreadPool::worker_loop, this);
     }
 }
@@ -98,6 +104,28 @@ inline void ThreadPool::shutdown() noexcept {
             worker.join();
         }
     }
+}
+
+inline void ThreadPool::launch() {
+    if (running()) {
+        shutdown(); // 等待当前线程池关闭
+        // 会确保队列为空，所有任务都被执行完毕
+    }
+    running_.store(true);
+    active_tasks_.store(0);
+    task_sequence_.store(0);
+    workers_.clear();
+    workers_.reserve(thread_count_);
+    for (std::size_t i = 0; i < thread_count_; ++i) {
+        workers_.emplace_back(&ThreadPool::worker_loop, this);
+    }
+}
+
+inline void ThreadPool::wait_idle() {
+    std::unique_lock lock(tasks_mutex_);
+    idle_condition_.wait(lock, [this] {
+        return tasks_.empty() && active_tasks_.load() == 0;
+    });
 }
 
 template <typename F, typename... Args>
@@ -139,7 +167,7 @@ inline void ThreadPool::worker_loop() {
 
             // 等待任务队列不为空或线程池停止运行
             tasks_condition_.wait(lock, [this] {
-                return !tasks_.empty() || !running();
+                return !running() || !tasks_.empty();
             });
 
             if (!running() && tasks_.empty()) {
@@ -150,8 +178,11 @@ inline void ThreadPool::worker_loop() {
             // top() 返回 const&，但我们即将 pop，所以 move 是安全的
             task = std::move(const_cast<PriorityTask &>(tasks_.top()).task);
             tasks_.pop();
+            ++active_tasks_;
         }
         // 执行任务
         task();
+        --active_tasks_;
+        idle_condition_.notify_all(); // 通知 wait_idle
     }
 }
