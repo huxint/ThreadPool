@@ -54,13 +54,13 @@ public:
         return thread_count_;
     }
 
-    // 等待所有任务执行完毕(不可在线程中调用)
+    // 等待所有任务执行完毕(不可提交到线程池中)
     void wait_idle();
 
-    // 重启线程池(不可在线程中调用)
+    // 重启线程池(不可提交到线程池中)
     void launch();
 
-    // 关闭线程池(不可在线程中调用)
+    // 关闭线程池(不可提交到线程池中)
     void shutdown() noexcept;
 
     // 判断线程池是否运行
@@ -103,6 +103,12 @@ inline void ThreadPool::shutdown() noexcept {
         if (worker.joinable()) {
             worker.join();
         }
+    }
+
+    // 清理未执行的任务
+    std::scoped_lock lock(tasks_mutex_);
+    while (!tasks_.empty()) {
+        tasks_.pop(); // broken_promise
     }
 }
 
