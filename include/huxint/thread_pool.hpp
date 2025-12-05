@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -114,8 +115,8 @@ class ThreadPool {
 public:
     explicit ThreadPool(std::size_t thread_count = std::jthread::hardware_concurrency())
     : active_tasks_(0),
-      stopping_(false),
-      thread_count_(std::max(thread_count, static_cast<std::size_t>(1))) {
+      stopping_(false) {
+        thread_count_ = std::clamp<std::size_t>(thread_count, 1, std::jthread::hardware_concurrency());
         workers_.reserve(thread_count_);
         for (std::size_t i = 0; i < thread_count_; ++i) {
             workers_.emplace_back(&ThreadPool::worker, this);
