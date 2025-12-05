@@ -95,8 +95,11 @@ inline ThreadPool::ThreadPool(std::size_t thread_count)
 }
 
 inline void ThreadPool::shutdown() noexcept {
-    if (!running_.exchange(false)) {
-        return; // 已经关闭过了
+    {
+        std::scoped_lock lock(tasks_mutex_);
+        if (!running_.exchange(false)) {
+            return; // 已经关闭过了
+        }
     }
     // 通知所有等待的线程来执行任务
     tasks_condition_.notify_all();
