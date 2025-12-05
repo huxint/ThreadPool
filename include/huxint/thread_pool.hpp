@@ -132,14 +132,24 @@ public:
     ThreadPool(ThreadPool &&) = delete;
     ThreadPool &operator=(ThreadPool &&) = delete;
 
-    // 向线程池提交一个任务（默认优先级）
-    template <typename F, typename... Args>
-    auto submit(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>> {
-        return submit(priority_t::normal, std::forward<F>(f), std::forward<Args>(args)...);
-    }
-
     // 向线程池提交一个任务
     template <typename F, typename... Args>
+    auto submit(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>> {
+        using return_type = std::invoke_result_t<F, Args...>;
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            [f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
+                return std::invoke(std::move(f), std::move(args)...);
+            });
+        auto result = task->get_future();
+        enqueue(priority_t::normal /* 这只是占位符 */, [task]() {
+            (*task)();
+        });
+        return result;
+    }
+
+    // 向线程池提交一个带优先级的任务（仅当 priority 启用时可用）
+    template <typename F, typename... Args>
+        requires priority_enabled
     auto submit(priority_t priority, F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>> {
         using return_type = std::invoke_result_t<F, Args...>;
         auto task = std::make_shared<std::packaged_task<return_type()>>(
@@ -158,12 +168,22 @@ public:
         requires cancellable_enabled
     auto submit_cancellable(F &&f, Args &&...args)
         -> cancellable_task<std::invoke_result_t<F, const cancellation_token &, Args...>> {
-        return submit_cancellable(priority_t::normal, std::forward<F>(f), std::forward<Args>(args)...);
+        using return_type = std::invoke_result_t<F, const cancellation_token &, Args...>;
+        cancellation_token token;
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            [f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
+                return std::invoke(std::move(f), std::cref(token), std::move(args)...);
+            });
+        auto result = task->get_future();
+        enqueue(priority_t::normal /* 这只是占位符 */, [task]() {
+            (*task)();
+        });
+        return cancellable_task<return_type>{std::move(result), token};
     }
 
-    // 向线程池提交一个带优先级的可取消任务
+    // 向线程池提交一个带优先级的可取消任务（仅当 cancellable 和 priority 都启用时可用）
     template <typename F, typename... Args>
-        requires cancellable_enabled
+        requires(cancellable_enabled && priority_enabled)
     auto submit_cancellable(priority_t priority, F &&f, Args &&...args)
         -> cancellable_task<std::invoke_result_t<F, const cancellation_token &, Args...>> {
         using return_type = std::invoke_result_t<F, const cancellation_token &, Args...>;
