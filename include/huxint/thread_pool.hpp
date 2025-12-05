@@ -34,29 +34,82 @@ struct priority_task_t {
 };
 
 /**
+ * @brief 可取消任务的取消令牌
+ * @details 用于检查任务是否被取消，以及请求取消任务。
+ */
+class cancellation_token {
+public:
+    cancellation_token()
+    : cancelled_(std::make_shared<std::atomic<bool>>(false)) {}
+
+    [[nodiscard]] bool is_cancelled() const noexcept {
+        return cancelled_->load(std::memory_order_acquire);
+    }
+
+    void cancel() noexcept {
+        cancelled_->store(true, std::memory_order_release);
+    }
+
+    void reset() noexcept {
+        cancelled_->store(false, std::memory_order_release);
+    }
+
+private:
+    std::shared_ptr<std::atomic<bool>> cancelled_;
+};
+
+/**
+ * @brief 可取消任务的句柄
+ * @details 包含 future 和取消令牌，用于获取结果和取消任务。
+ */
+template <typename T>
+struct cancellable_task {
+    std::future<T> future;
+    cancellation_token token;
+
+    void cancel() noexcept {
+        token.cancel();
+    }
+
+    [[nodiscard]] bool is_cancelled() const noexcept {
+        return token.is_cancelled();
+    }
+
+    T get() {
+        return future.get();
+    }
+
+    void wait() const {
+        future.wait();
+    }
+
+    [[nodiscard]] bool valid() const noexcept {
+        return future.valid();
+    }
+};
+
+/**
  * @brief 线程池的操作类型掩码
  */
 using opt_t = std::uint8_t;
 enum op : opt_t {
     /**
-     * @brief 无操作
+     * @brief 操作掩码
      */
     none = 0,
-
-    /**
-     * @brief 支持任务优先级
-     */
-    priority = 1 << 0
+    priority = 1 << 0,
+    cancellable = 1 << 1
 };
 
 /**
  * @brief 线程池的操作类型
- * @details 线程池的操作类型可以是 `op::none`、`op::priority` 或它们的组合。(后续可能加上其他操作)
- *          例如，`op::priority` 或者 `op::none | op::priority` 表示线程池支持任务优先级。
+ * @details 线程池的操作类型可以是 `op::none`、`op::priority`、`op::cancellable` 或它们的组合。
+ *          例如，`op::priority` 或者 `op::cancellable | op::priority`
  */
 template <opt_t masks = op::none>
 class ThreadPool {
     static constexpr bool priority_enabled = (masks & op::priority) != 0;
+    static constexpr bool cancellable_enabled = (masks & op::cancellable) != 0;
 
 public:
     explicit ThreadPool(std::size_t thread_count = std::jthread::hardware_concurrency())
@@ -79,8 +132,7 @@ public:
     ThreadPool(ThreadPool &&) = delete;
     ThreadPool &operator=(ThreadPool &&) = delete;
 
-    // 向线程池提交一个任务
-    // 默认优先级为 Normal
+    // 向线程池提交一个任务（默认优先级）
     template <typename F, typename... Args>
     auto submit(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>> {
         return submit(priority_t::normal, std::forward<F>(f), std::forward<Args>(args)...);
@@ -90,34 +142,41 @@ public:
     template <typename F, typename... Args>
     auto submit(priority_t priority, F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>> {
         using return_type = std::invoke_result_t<F, Args...>;
-
         auto task = std::make_shared<std::packaged_task<return_type()>>(
             [f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
                 return std::invoke(std::move(f), std::move(args)...);
             });
-
-        std::future<return_type> result = task->get_future();
-
-        {
-            std::scoped_lock lock(tasks_mutex_);
-            if (stopping_.load(std::memory_order_acquire)) {
-                throw std::runtime_error("submit task to stopped thread pool");
-            }
-
-            if constexpr (priority_enabled) {
-                tasks_.emplace(priority, [task]() {
-                    (*task)();
-                });
-            } else {
-                tasks_.emplace([task]() {
-                    (*task)();
-                });
-            }
-        }
-
-        // 通知一个等待的线程来执行任务
-        tasks_condition_.notify_one();
+        auto result = task->get_future();
+        enqueue(priority, [task]() {
+            (*task)();
+        });
         return result;
+    }
+
+    // 向线程池提交一个可取消的任务（仅当 cancellable 启用时可用）
+    template <typename F, typename... Args>
+        requires cancellable_enabled
+    auto submit_cancellable(F &&f, Args &&...args)
+        -> cancellable_task<std::invoke_result_t<F, const cancellation_token &, Args...>> {
+        return submit_cancellable(priority_t::normal, std::forward<F>(f), std::forward<Args>(args)...);
+    }
+
+    // 向线程池提交一个带优先级的可取消任务
+    template <typename F, typename... Args>
+        requires cancellable_enabled
+    auto submit_cancellable(priority_t priority, F &&f, Args &&...args)
+        -> cancellable_task<std::invoke_result_t<F, const cancellation_token &, Args...>> {
+        using return_type = std::invoke_result_t<F, const cancellation_token &, Args...>;
+        cancellation_token token;
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            [f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
+                return std::invoke(std::move(f), std::cref(token), std::move(args)...);
+            });
+        auto result = task->get_future();
+        enqueue(priority, [task]() {
+            (*task)();
+        });
+        return cancellable_task<return_type>{std::move(result), token};
     }
 
     // 获取线程池中的线程数量
@@ -165,6 +224,22 @@ public:
     }
 
 private:
+    // 将任务加入队列的公共逻辑
+    void enqueue(priority_t priority, std::move_only_function<void()> &&task_wrapper) {
+        {
+            std::scoped_lock lock(tasks_mutex_);
+            if (stopping_.load(std::memory_order_acquire)) {
+                throw std::runtime_error("submit task to stopped thread pool");
+            }
+            if constexpr (priority_enabled) {
+                tasks_.emplace(priority, std::move(task_wrapper));
+            } else {
+                tasks_.emplace(std::move(task_wrapper));
+            }
+        }
+        tasks_condition_.notify_one();
+    }
+
     void worker(std::stop_token stop_token) {
         while (true) {
             std::move_only_function<void()> task;
