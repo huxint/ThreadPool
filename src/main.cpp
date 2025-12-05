@@ -22,7 +22,6 @@ int main() {
     }
 
     std::print("Submitted {} tasks\n", num_tasks);
-    std::print("Pending tasks: {}\n", pool.pending_task_count());
 
     double total = 0;
     for (auto &f : futures) {
