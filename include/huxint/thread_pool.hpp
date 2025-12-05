@@ -8,6 +8,7 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -60,6 +61,7 @@ class ThreadPool {
 public:
     explicit ThreadPool(std::size_t thread_count = std::jthread::hardware_concurrency())
     : active_tasks_(0),
+      stopping_(false),
       thread_count_(std::max(thread_count, static_cast<std::size_t>(1))) {
         workers_.reserve(thread_count_);
         for (std::size_t i = 0; i < thread_count_; ++i) {
@@ -98,7 +100,7 @@ public:
 
         {
             std::scoped_lock lock(tasks_mutex_);
-            if (workers_.empty()) {
+            if (stopping_.load(std::memory_order_acquire)) {
                 throw std::runtime_error("submit task to stopped thread pool");
             }
 
@@ -136,32 +138,30 @@ public:
         std::scoped_lock lock(lifecycle_mutex_);
         shutdown();
         active_tasks_.store(0);
+        stopping_.store(false, std::memory_order_release);
         workers_.reserve(thread_count_);
         for (std::size_t i = 0; i < thread_count_; ++i) {
             workers_.emplace_back(&ThreadPool::worker, this);
         }
     }
 
-    // 关闭线程池(不可提交到当前线程池中)
+    // 关闭线程池(不可提交到当前线程池中)，等待所有已提交任务执行完毕
     void shutdown() noexcept {
         std::scoped_lock lock(lifecycle_mutex_);
+        stopping_.store(true, std::memory_order_release);
+        wait();
         // request_stop 会让 stop_token 生效
         for (auto &worker : workers_) {
             worker.request_stop();
         }
         tasks_condition_.notify_all();
         workers_.clear(); // jthread 析构自动 join
-
-        // 清理未执行的任务
-        std::scoped_lock tasks_lock(tasks_mutex_);
-        while (!tasks_.empty()) {
-            tasks_.pop(); // broken_promise
-        }
     }
 
     // 判断线程池是否运行
     [[nodiscard]] bool running() const noexcept {
-        return !workers_.empty() && !workers_.front().get_stop_token().stop_requested();
+        return !workers_.empty() && !stopping_.load(std::memory_order_acquire) &&
+               !workers_.front().get_stop_token().stop_requested();
     }
 
 private:
@@ -211,4 +211,5 @@ private:
         tasks_;                               // 任务队列
     std::atomic<std::uint64_t> active_tasks_; // 正在执行的任务数
     std::size_t thread_count_;                // 线程池中的线程数量
+    std::atomic<bool> stopping_;              // 是否正在停止
 };
