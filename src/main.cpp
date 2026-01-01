@@ -1,5 +1,7 @@
 #include <print>
-#include <huxint/thread_pool.hpp>
+#include <huxint/thread_pool>
+
+using namespace huxint;
 
 // 测试基础线程池
 void test_basic_pool() {
