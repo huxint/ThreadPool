@@ -116,11 +116,8 @@ public:
     explicit ThreadPool(std::size_t thread_count = std::jthread::hardware_concurrency())
     : active_tasks_(0),
       stopping_(false) {
-        thread_count_ = std::clamp<std::size_t>(thread_count, 1, std::jthread::hardware_concurrency());
-        workers_.reserve(thread_count_);
-        for (std::size_t i = 0; i < thread_count_; ++i) {
-            workers_.emplace_back(&ThreadPool::worker, this);
-        }
+        thread_count_ = std::max<std::size_t>(thread_count, 1);
+        spawn_workers();
     }
 
     ~ThreadPool() noexcept {
@@ -219,10 +216,7 @@ public:
         shutdown();
         active_tasks_.store(0);
         stopping_.store(false, std::memory_order_release);
-        workers_.reserve(thread_count_);
-        for (std::size_t i = 0; i < thread_count_; ++i) {
-            workers_.emplace_back(&ThreadPool::worker, this);
-        }
+        spawn_workers();
     }
 
     // 关闭线程池(不可提交到当前线程池中)，等待所有已提交任务执行完毕
@@ -245,6 +239,15 @@ public:
     }
 
 private:
+    void spawn_workers() {
+        workers_.reserve(thread_count_);
+        for (std::size_t i = 0; i < thread_count_; ++i) {
+            workers_.emplace_back([this](std::stop_token st) {
+                worker(st);
+            });
+        }
+    }
+
     // 将任务加入队列的公共逻辑
     void enqueue(priority_t priority, std::move_only_function<void()> &&task_wrapper) {
         {
