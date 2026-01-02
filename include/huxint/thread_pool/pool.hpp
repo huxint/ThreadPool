@@ -35,8 +35,8 @@ class ThreadPool {
 
 public:
     explicit ThreadPool(std::size_t thread_size = std::jthread::hardware_concurrency())
-    : active_tasks_(0),
-      stopping_(false) {
+    : active_tasks_(0) {
+        stopping_.clear();
         thread_size_ = std::max<std::size_t>(thread_size, 1);
         spawn();
     }
@@ -127,13 +127,13 @@ public:
         std::scoped_lock lock(lifecycle_mutex_);
         shutdown();
         active_tasks_.store(0);
-        stopping_.store(false, std::memory_order_release);
+        stopping_.clear(std::memory_order_release);
         spawn();
     }
 
     void shutdown() noexcept {
         std::scoped_lock lock(lifecycle_mutex_);
-        stopping_.store(true, std::memory_order_release);
+        stopping_.test_and_set(std::memory_order_release);
         wait();
         for (auto &worker : workers_) {
             worker.request_stop();
@@ -144,7 +144,7 @@ public:
 
     [[nodiscard]]
     bool running() const noexcept {
-        return !workers_.empty() && !stopping_.load(std::memory_order_acquire) && !workers_.front().get_stop_token().stop_requested();
+        return !workers_.empty() && !stopping_.test(std::memory_order_acquire) && !workers_.front().get_stop_token().stop_requested();
     }
 
 private:
@@ -160,7 +160,7 @@ private:
     void enqueue(priority_t priority, std::move_only_function<void()> &&task_wrapper) {
         {
             std::scoped_lock lock(tasks_mutex_);
-            if (stopping_.load(std::memory_order_acquire)) {
+            if (stopping_.test(std::memory_order_acquire)) {
                 throw std::runtime_error("submit task to stopped thread pool");
             }
             if constexpr (priority_enabled) {
@@ -212,7 +212,6 @@ private:
     std::conditional_t<priority_enabled, std::priority_queue<priority_task_t>, std::queue<std::move_only_function<void()>>> tasks_;
     std::atomic<std::uint64_t> active_tasks_;
     std::size_t thread_size_;
-    std::atomic<bool> stopping_;
+    std::atomic_flag stopping_;
 };
-
 } // namespace thread_pool
