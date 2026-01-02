@@ -14,28 +14,31 @@
 #include <thread>
 #include <vector>
 
-namespace huxint {
+namespace thread_pool {
 /**
  * @brief 线程池的操作类型掩码
  */
-using opt_t = std::uint8_t;
-enum op : opt_t { none = 0, priority = 1 << 0, cancellable = 1 << 1 };
+enum op : std::uint8_t {
+    none = 0,
+    priority = 1 << 0,
+    cancellable = 1 << 1
+};
 
 /**
  * @brief 线程池
  * @tparam masks 操作类型掩码，可组合 op::priority 和 op::cancellable
  */
-template <opt_t masks = op::none>
+template <std::uint8_t masks = op::none>
 class ThreadPool {
     static constexpr bool priority_enabled = (masks & op::priority) != 0;
     static constexpr bool cancellable_enabled = (masks & op::cancellable) != 0;
 
 public:
-    explicit ThreadPool(std::size_t thread_count = std::jthread::hardware_concurrency())
+    explicit ThreadPool(std::size_t thread_size = std::jthread::hardware_concurrency())
     : active_tasks_(0),
       stopping_(false) {
-        thread_count_ = std::max<std::size_t>(thread_count, 1);
-        spawn_workers();
+        thread_size_ = std::max<std::size_t>(thread_size, 1);
+        spawn();
     }
 
     ~ThreadPool() noexcept {
@@ -51,10 +54,9 @@ public:
     template <typename F, typename... Args>
     auto submit(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>> {
         using return_type = std::invoke_result_t<F, Args...>;
-        auto task = std::make_shared<std::packaged_task<return_type()>>(
-            [f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
-                return std::invoke(std::move(f), std::move(args)...);
-            });
+        auto task = std::make_shared<std::packaged_task<return_type()>>([f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
+            return std::invoke(std::move(f), std::move(args)...);
+        });
         auto result = task->get_future();
         enqueue(priority_t::normal, [task]() {
             (*task)();
@@ -67,10 +69,9 @@ public:
         requires priority_enabled
     auto submit(priority_t priority, F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>> {
         using return_type = std::invoke_result_t<F, Args...>;
-        auto task = std::make_shared<std::packaged_task<return_type()>>(
-            [f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
-                return std::invoke(std::move(f), std::move(args)...);
-            });
+        auto task = std::make_shared<std::packaged_task<return_type()>>([f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
+            return std::invoke(std::move(f), std::move(args)...);
+        });
         auto result = task->get_future();
         enqueue(priority, [task]() {
             (*task)();
@@ -81,41 +82,38 @@ public:
     /// 提交可取消的任务
     template <typename F, typename... Args>
         requires cancellable_enabled
-    auto submit_cancellable(F &&f, Args &&...args)
-        -> cancellable_task<std::invoke_result_t<F, const cancellation_token &, Args...>> {
-        using return_type = std::invoke_result_t<F, const cancellation_token &, Args...>;
-        cancellation_token token;
-        auto task = std::make_shared<std::packaged_task<return_type()>>(
-            [f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
-                return std::invoke(std::move(f), std::cref(token), std::move(args)...);
-            });
+    auto submit(F &&f, Args &&...args) -> cancellation::task<std::invoke_result_t<F, const cancellation::token &, Args...>> {
+        using return_type = std::invoke_result_t<F, const cancellation::token &, Args...>;
+        cancellation::token token;
+        auto task = std::make_shared<std::packaged_task<return_type()>>([f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
+            return std::invoke(std::move(f), std::cref(token), std::move(args)...);
+        });
         auto result = task->get_future();
         enqueue(priority_t::normal, [task]() {
             (*task)();
         });
-        return cancellable_task<return_type>{std::move(result), token};
+        return cancellation::task<return_type>{std::move(result), token};
     }
 
     /// 提交带优先级的可取消任务
     template <typename F, typename... Args>
         requires(cancellable_enabled && priority_enabled)
-    auto submit_cancellable(priority_t priority, F &&f, Args &&...args)
-        -> cancellable_task<std::invoke_result_t<F, const cancellation_token &, Args...>> {
-        using return_type = std::invoke_result_t<F, const cancellation_token &, Args...>;
-        cancellation_token token;
-        auto task = std::make_shared<std::packaged_task<return_type()>>(
-            [f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
-                return std::invoke(std::move(f), std::cref(token), std::move(args)...);
-            });
+    auto submit(priority_t priority, F &&f, Args &&...args) -> cancellation::task<std::invoke_result_t<F, const cancellation::token &, Args...>> {
+        using return_type = std::invoke_result_t<F, const cancellation::token &, Args...>;
+        cancellation::token token;
+        auto task = std::make_shared<std::packaged_task<return_type()>>([f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
+            return std::invoke(std::move(f), std::cref(token), std::move(args)...);
+        });
         auto result = task->get_future();
         enqueue(priority, [task]() {
             (*task)();
         });
-        return cancellable_task<return_type>{std::move(result), token};
+        return cancellation::task<return_type>{std::move(result), token};
     }
 
-    [[nodiscard]] std::size_t thread_count() const noexcept {
-        return thread_count_;
+    [[nodiscard]]
+    std::size_t thread_size() const noexcept {
+        return thread_size_;
     }
 
     void wait() {
@@ -130,7 +128,7 @@ public:
         shutdown();
         active_tasks_.store(0);
         stopping_.store(false, std::memory_order_release);
-        spawn_workers();
+        spawn();
     }
 
     void shutdown() noexcept {
@@ -144,15 +142,15 @@ public:
         workers_.clear();
     }
 
-    [[nodiscard]] bool running() const noexcept {
-        return !workers_.empty() && !stopping_.load(std::memory_order_acquire) &&
-               !workers_.front().get_stop_token().stop_requested();
+    [[nodiscard]]
+    bool running() const noexcept {
+        return !workers_.empty() && !stopping_.load(std::memory_order_acquire) && !workers_.front().get_stop_token().stop_requested();
     }
 
 private:
-    void spawn_workers() {
-        workers_.reserve(thread_count_);
-        for (std::size_t i = 0; i < thread_count_; ++i) {
+    void spawn() {
+        workers_.reserve(thread_size_);
+        for (std::size_t i = 0; i < thread_size_; ++i) {
             workers_.emplace_back([this](std::stop_token st) {
                 worker(st);
             });
@@ -211,13 +209,10 @@ private:
     std::condition_variable tasks_condition_;
     std::condition_variable idle_condition_;
     std::vector<std::jthread> workers_;
-    std::conditional_t<priority_enabled,
-                       std::priority_queue<priority_task_t>,
-                       std::queue<std::move_only_function<void()>>>
-        tasks_;
+    std::conditional_t<priority_enabled, std::priority_queue<priority_task_t>, std::queue<std::move_only_function<void()>>> tasks_;
     std::atomic<std::uint64_t> active_tasks_;
-    std::size_t thread_count_;
+    std::size_t thread_size_;
     std::atomic<bool> stopping_;
 };
 
-} // namespace huxint
+} // namespace thread_pool

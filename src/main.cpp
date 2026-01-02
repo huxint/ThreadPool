@@ -1,7 +1,7 @@
 #include <print>
-#include <huxint/thread_pool>
+#include <huxint/thread_pool.hpp>
 
-using namespace huxint;
+using namespace thread_pool;
 
 // 测试基础线程池
 void test_basic_pool() {
@@ -18,8 +18,7 @@ void test_basic_pool() {
         [](int a, int b) {
             return a + b;
         },
-        10,
-        20);
+        10, 20);
     std::println("{}", f2.get());
 
     // 测试3: 多个并发任务
@@ -90,9 +89,9 @@ void test_cancellable_pool() {
     ThreadPool<op::cancellable> pool(4);
 
     // 测试1: 正常完成
-    auto task1 = pool.submit_cancellable([](const cancellation_token &token) {
+    auto task1 = pool.submit([](const cancellation::token &token) {
         int sum = 0;
-        for (int i = 0; i < 100 && !token.is_cancelled(); ++i) {
+        for (int i = 0; i < 100 && !token.cancelled(); ++i) {
             sum += i;
         }
         return sum;
@@ -100,28 +99,27 @@ void test_cancellable_pool() {
     std::println("{}", task1.get());
 
     // 测试2: 取消正在运行的任务
-    auto task2 = pool.submit_cancellable([](const cancellation_token &token) {
+    auto task2 = pool.submit([](const cancellation::token &token) {
         int iterations = 0;
-        while (!token.is_cancelled()) {
+        while (!token.cancelled()) {
             ++iterations;
         }
         return iterations;
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     task2.cancel();
-    std::println("{} {}", task2.get(), task2.is_cancelled());
+    std::println("{} {}", task2.get(), task2.cancelled());
 
     // 测试3: 带参数的可取消任务
-    auto task3 = pool.submit_cancellable(
-        [](const cancellation_token &token, int start, int end) {
+    auto task3 = pool.submit(
+        [](const cancellation::token &token, int start, int end) {
             std::int64_t sum = 0;
-            for (int i = start; i < end && !token.is_cancelled(); ++i) {
+            for (int i = start; i < end && !token.cancelled(); ++i) {
                 sum += i;
             }
             return sum;
         },
-        1,
-        100000000);
+        1, 100000000);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
     task3.cancel();
