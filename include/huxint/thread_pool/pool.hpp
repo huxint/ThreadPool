@@ -50,6 +50,45 @@ public:
     ThreadPool(ThreadPool &&) = delete;
     ThreadPool &operator=(ThreadPool &&) = delete;
 
+    /// 执行任务（fire-and-forget，无返回值，避免 shared_ptr 开销）
+    template <typename F, typename... Args>
+    void execute(F &&f, Args &&...args) {
+        enqueue(priority_t::normal, [f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
+            std::invoke(std::move(f), std::move(args)...);
+        });
+    }
+
+    /// 执行带优先级的任务（fire-and-forget）
+    template <typename F, typename... Args>
+        requires priority_enabled
+    void execute(priority_t priority, F &&f, Args &&...args) {
+        enqueue(priority, [f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
+            std::invoke(std::move(f), std::move(args)...);
+        });
+    }
+
+    /// 执行可取消的任务（fire-and-forget，返回 token 用于取消）
+    template <typename F, typename... Args>
+        requires cancellable_enabled
+    cancellation::token execute(F &&f, Args &&...args) {
+        cancellation::token token;
+        enqueue(priority_t::normal, [f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
+            std::invoke(std::move(f), std::cref(token), std::move(args)...);
+        });
+        return token;
+    }
+
+    /// 执行带优先级的可取消任务（fire-and-forget）
+    template <typename F, typename... Args>
+        requires(cancellable_enabled && priority_enabled)
+    cancellation::token execute(priority_t priority, F &&f, Args &&...args) {
+        cancellation::token token;
+        enqueue(priority, [f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
+            std::invoke(std::move(f), std::cref(token), std::move(args)...);
+        });
+        return token;
+    }
+
     /// 提交普通任务
     template <typename F, typename... Args>
     auto submit(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>> {
