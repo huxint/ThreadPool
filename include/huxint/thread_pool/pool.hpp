@@ -254,3 +254,22 @@ private:
     std::atomic_flag stopping_;
 };
 } // namespace thread_pool
+
+namespace thread_pool {
+/**
+ * @brief 等待所有 future 完成
+ */
+template <typename... Futures>
+void wait(Futures &&...futures) {
+    (futures.wait(), ...);
+}
+
+/**
+ * @brief 获取所有 future 的结果
+ * @return std::tuple 包含所有结果
+ */
+template <typename... Futures>
+auto collect(Futures &&...futures) {
+    return std::make_tuple(futures.get()...);
+}
+} // namespace thread_pool
