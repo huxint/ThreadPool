@@ -25,8 +25,8 @@ pool.submit(priority_t::high, [] { /* 高优先级任务 */ });
 
 // 可取消任务
 ThreadPool<op::cancellable> pool;
-auto task = pool.submit_cancellable([](const cancellation_token& token) {
-    while (!token.is_cancelled()) {
+auto task = pool.submit([](token_ref token) {
+    while (!token.cancelled()) {
         // 工作...
     }
 });
