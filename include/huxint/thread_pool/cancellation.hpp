@@ -63,4 +63,6 @@ struct task {
     }
 };
 } // namespace cancellation
+/// 取消令牌的常量引用类型别名
+using token_ref = const cancellation::token &;
 } // namespace thread_pool

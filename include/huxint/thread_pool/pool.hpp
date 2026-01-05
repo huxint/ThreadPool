@@ -3,6 +3,7 @@
 #include "cancellation.hpp"
 #include <algorithm>
 #include <atomic>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
@@ -15,6 +16,10 @@
 #include <vector>
 
 namespace thread_pool {
+template <typename F, typename... Args>
+concept invocable_with_token = std::invocable<F, const cancellation::token &, Args...>;
+template <typename F, typename... Args>
+concept non_invocable_with_token = !std::invocable<F, const cancellation::token &, Args...>;
 /**
  * @brief 线程池的操作类型掩码
  */
@@ -52,6 +57,7 @@ public:
 
     /// 执行任务（fire-and-forget，无返回值，避免 shared_ptr 开销）
     template <typename F, typename... Args>
+        requires non_invocable_with_token<F, Args...>
     void execute(F &&f, Args &&...args) {
         enqueue(priority_t::normal, [f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
             std::invoke(std::move(f), std::move(args)...);
@@ -60,7 +66,7 @@ public:
 
     /// 执行带优先级的任务（fire-and-forget）
     template <typename F, typename... Args>
-        requires priority_enabled
+        requires priority_enabled && non_invocable_with_token<F, Args...>
     void execute(priority_t priority, F &&f, Args &&...args) {
         enqueue(priority, [f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
             std::invoke(std::move(f), std::move(args)...);
@@ -69,7 +75,7 @@ public:
 
     /// 执行可取消的任务（fire-and-forget，返回 token 用于取消）
     template <typename F, typename... Args>
-        requires cancellable_enabled
+        requires cancellable_enabled && invocable_with_token<F, Args...>
     cancellation::token execute(F &&f, Args &&...args) {
         cancellation::token token;
         enqueue(priority_t::normal, [f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
@@ -80,7 +86,7 @@ public:
 
     /// 执行带优先级的可取消任务（fire-and-forget）
     template <typename F, typename... Args>
-        requires(cancellable_enabled && priority_enabled)
+        requires cancellable_enabled && priority_enabled && invocable_with_token<F, Args...>
     cancellation::token execute(priority_t priority, F &&f, Args &&...args) {
         cancellation::token token;
         enqueue(priority, [f = std::forward<F>(f), token, ... args = std::forward<Args>(args)]() mutable {
