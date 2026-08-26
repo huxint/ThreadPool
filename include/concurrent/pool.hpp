@@ -296,7 +296,9 @@ namespace concurrent {
                     }
                     return std::unexpected(ok.error());
                 }
-                trace_enqueue(ids[i], task_priority::normal);
+                if constexpr (TRACE) { // 关闭时不求值 ids[i](空向量)
+                    trace_enqueue(ids[i], task_priority::normal);
+                }
             }
             if (!staged.empty()) {
                 notify_wake();
