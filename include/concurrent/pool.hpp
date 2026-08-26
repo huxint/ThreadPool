@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <ranges>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -225,6 +226,85 @@ namespace concurrent {
         }
 
         /**
+         * @brief 批量提交: 对区间每个元素提交 f(e), 全部落队后仅唤醒一次
+         *
+         * 与逐元素 submit 的差异仅在通知摊薄与两阶段提交:
+         *  - 阶段一构建全部节点(不入队), 构建期失败整体回滚, 无半成品;
+         *  - 阶段二依序入队, 仅 stopping 可败 - 此时已入队者照常运行
+         *    (句柄随错误返回丢弃), 未入队者以取消语义终结
+         *
+         * 元素按值拷贝进各闭包(任务并发执行, 不得共享可变状态); 零拷贝
+         * 需求请用 parallel_map/parallel_for. callable 同样支持 stop_token
+         * 首参; 以 normal 优先级入队
+         */
+        template <typename Rng, typename F>
+            requires std::ranges::input_range<Rng> &&
+                     (std::invocable<F&, std::ranges::range_value_t<Rng>> ||
+                      std::invocable<F&, std::stop_token, std::ranges::range_value_t<Rng>>)
+        [[nodiscard]]
+        auto submit_each(Rng&& rng, F f)
+            -> std::expected<std::vector<task<detail::submit_result_t<
+                                 F, std::ranges::range_value_t<Rng>>>>,
+                             submit_error> {
+            using elem_t = std::ranges::range_value_t<Rng>;
+            using R = detail::submit_result_t<F, elem_t>;
+
+            std::vector<task<R>> out;
+            std::vector<node_t*> staged;
+            [[maybe_unused]] std::vector<std::uint64_t> ids;
+
+            // 阶段一: 整体构建. 任一失败回滚全部半成品(终结状态防悬挂)
+            try {
+                if constexpr (std::ranges::sized_range<Rng>) {
+                    const auto n = static_cast<std::size_t>(std::ranges::size(rng));
+                    out.reserve(n);
+                    staged.reserve(n);
+                    if constexpr (TRACE) {
+                        ids.reserve(n);
+                    }
+                }
+                for (auto&& e : rng) {
+                    std::shared_ptr<detail::shared_state<R>> st;
+                    node_t* node = build_submit_node(task_priority::normal, st, f,
+                                                     elem_t(std::forward<decltype(e)>(e)));
+                    if (!node) [[unlikely]] {
+                        for (auto* n2 : staged) {
+                            abandon(n2);
+                        }
+                        return std::unexpected(submit_error::out_of_memory);
+                    }
+                    staged.push_back(node);
+                    if constexpr (TRACE) {
+                        ids.push_back(st->id);
+                    }
+                    out.emplace_back(std::move(st));
+                }
+            } catch (...) { // F/元素拷贝的用户异常原样透传, 半成品照旧回收
+                for (auto* n2 : staged) {
+                    abandon(n2);
+                }
+                throw;
+            }
+
+            // 阶段二: 依序入队, 单次唤醒
+            for (std::size_t i = 0; i < staged.size(); ++i) {
+                auto ok = enqueue(static_cast<int>(level_of(task_priority::normal)),
+                                  staged[i]);
+                if (!ok) {
+                    for (++i; i < staged.size(); ++i) {
+                        abandon(staged[i]); // 从未入队: 终结后销毁
+                    }
+                    return std::unexpected(ok.error());
+                }
+                trace_enqueue(ids[i], task_priority::normal);
+            }
+            if (!staged.empty()) {
+                notify_wake();
+            }
+            return out;
+        }
+
+        /**
          * @brief 即发即忘执行(无结果通道). callable 必须 noexcept - 编译期强制
          *
          * @return 失败仅在提交边界发生(池已停 / 内存不足)
@@ -348,13 +428,20 @@ namespace concurrent {
         }
 
     private:
+        /// 构建 submit 型节点(状态 + 闭包 + 丢弃终结钩子), 未入队
+        /// @return 空 = 仅因 bad_alloc; 其余异常(F/实参拷贝)原样传播
         template <typename R, typename F, typename... Args>
-        std::expected<task<R>, submit_error> submit_impl(task_priority prio, F&& f,
-                                                         Args&&... args) {
-            auto st = detail::make_state<R>();
+        node_t* build_submit_node(task_priority prio,
+                                  std::shared_ptr<detail::shared_state<R>>& st, F&& f,
+                                  Args&&... args) {
+            try {
+                st = detail::make_state<R>();
+            } catch (const std::bad_alloc&) {
+                return nullptr;
+            }
             node_t* node = acquire_node();
             if (!node) [[unlikely]] {
-                return std::unexpected(submit_error::out_of_memory);
+                return nullptr; // st 随作用域释放
             }
 
             if constexpr (TRACE) {
@@ -380,6 +467,18 @@ namespace concurrent {
                 static_cast<detail::shared_state<R>*>(p)->set_cancelled();
                 static_cast<detail::shared_state<R>*>(p)->finish();
             };
+            return node;
+        }
+
+        template <typename R, typename F, typename... Args>
+        std::expected<task<R>, submit_error> submit_impl(task_priority prio, F&& f,
+                                                         Args&&... args) {
+            std::shared_ptr<detail::shared_state<R>> st;
+            node_t* node =
+                build_submit_node(prio, st, std::forward<F>(f), std::forward<Args>(args)...);
+            if (!node) [[unlikely]] {
+                return std::unexpected(submit_error::out_of_memory);
+            }
 
             if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
                 return std::unexpected(ok.error());
@@ -490,9 +589,9 @@ namespace concurrent {
             }
         }
 
-        /// 入队并唤醒一个 worker
+        /// 入队, 不含唤醒(批量提交方据此摊薄通知成本)
         /// @return 空 = 成功; 非空 = submit_error
-        std::expected<void, submit_error> route(int level, node_t* node) noexcept {
+        std::expected<void, submit_error> enqueue(int level, node_t* node) noexcept {
             pending_.fetch_add(1, std::memory_order_acq_rel);
             if (stopping_.load(std::memory_order_acquire)) [[unlikely]] {
                 destroy_node(node);
@@ -503,11 +602,19 @@ namespace concurrent {
             // worker 内嵌套提交: 优先本地 deque(LIFO 缓存热度)
             if (detail::tls_pool == this && ctxs_[detail::tls_worker].local[level].push(node))
                 [[likely]] {
-                notify_wake();
                 return {};
             }
             // 外部提交或本地溢出: 全局队列(环满自动落入溢出链, 永不失败, 永不阻塞)
             (*globals_)[level].push(node);
+            return {};
+        }
+
+        /// 入队并唤醒一个 worker
+        /// @return 空 = 成功; 非空 = submit_error
+        std::expected<void, submit_error> route(int level, node_t* node) noexcept {
+            if (auto ok = enqueue(level, node); !ok) {
+                return ok;
+            }
             notify_wake();
             return {};
         }
@@ -544,6 +651,15 @@ namespace concurrent {
         void destroy_node(node_t* n) noexcept {
             n->body.reset();
             delete n;
+        }
+
+        /// 收尾从未入队的节点: 先以取消语义终结其共享状态(若有)再销毁,
+        /// 使持有句柄的一方经错误通道观测 operation_cancelled 而非永久等待
+        void abandon(node_t* n) noexcept {
+            if (n->discard) {
+                n->discard(n->discard_ctx);
+            }
+            destroy_node(n);
         }
 
         void spawn_workers() {
@@ -670,10 +786,7 @@ namespace concurrent {
             // 计数必须随销毁同步扣减: 若留到循环之后, "等待计数归零"与
             // "扣减被销毁节点的计数"互为因果, 将永久自锁
             auto account_drop = [this](node_t* n) noexcept {
-                if (n->discard) {
-                    n->discard(n->discard_ctx); // 先于 body 析构终结其共享状态
-                }
-                destroy_node(n);
+                abandon(n);
                 if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     idle_gen_.fetch_add(1, std::memory_order_release);
                     idle_gen_.notify_all();

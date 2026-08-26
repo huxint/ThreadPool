@@ -121,6 +121,7 @@ p.wait();
 | `execute(f, args...)` | `f` 必须 `noexcept` | `expected<void, submit_error>` |
 | `execute(prio, f, ...)` | 同上 + `priority` 标签 | 同上 |
 | `execute(f, ...)` 带 stop_token 形参 | `cancellable` 标签 | `expected<stop_source, submit_error>` |
+| `submit_each(range, f)` | 区间每元素一任务, 整批单次唤醒; 元素按值拷贝 | `expected<vector<task<R>>, submit_error>` |
 
 `submit` 的 callable 接受 `const std::stop_token&` 首参即获得协作取消能力, 返回的 `task` 携带 `request_stop()`
 

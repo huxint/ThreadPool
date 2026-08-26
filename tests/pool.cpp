@@ -57,6 +57,48 @@ TEST_SUITE("concurrent.pool") {
         CHECK(t->get().value_or(-1) == 42);
     }
 
+    TEST_CASE("submit_each_maps_elements_and_batches_wake") {
+        pool p({.threads = 4});
+        std::vector<int> data(1000);
+        for (int i = 0; i < 1000; ++i) {
+            data[static_cast<std::size_t>(i)] = i;
+        }
+
+        auto r = p.submit_each(data, [](int x) { return x * 2; });
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == data.size());
+
+        long long sum = 0;
+        for (auto& t : *r) {
+            sum += t.get().value_or(-1);
+        }
+        CHECK(sum == 999 * 1000); // 2 * Σ(0..999)
+    }
+
+    TEST_CASE("submit_each_supports_stop_token") {
+        pool p({.threads = 2});
+        const std::vector<int> data{1, 2, 3};
+        auto r = p.submit_each(data, [](std::stop_token, int x) { return x + 10; });
+        REQUIRE(r.has_value());
+        CHECK((*r)[0].get().value_or(-1) == 11);
+        CHECK((*r)[2].get().value_or(-1) == 13);
+    }
+
+    TEST_CASE("submit_each_empty_range_no_wake") {
+        pool p({.threads = 1});
+        auto r = p.submit_each(std::vector<int>{}, [](int) { return 0; });
+        REQUIRE(r.has_value());
+        CHECK(r->empty());
+    }
+
+    TEST_CASE("submit_each_after_shutdown_returns_stopped") {
+        pool p({.threads = 1});
+        p.shutdown();
+        auto r = p.submit_each(std::vector<int>{1, 2, 3}, [](int x) { return x; });
+        REQUIRE(!r.has_value());
+        CHECK(r.error() == submit_error::stopped);
+    }
+
     TEST_CASE("execute_fire_and_forget") {
         pool p({.threads = 4});
         std::atomic<int> total{0};
