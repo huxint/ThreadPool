@@ -73,6 +73,11 @@ namespace concurrent {
         /// 两个链接字段服务于互斥的三种归属(环/溢出链, 空闲链), 故不会同时使用:
         struct task_node {
             sbo_function<64> body;
+            /// 排队中被关闭丢弃时的状态收尾(仅 submit 路径设置). 必须先于
+            /// body 析构调用: 闭包持有共享状态引用, 若随节点直接湮灭,
+            /// 用户侧 get() 将在 done 等待上永久阻塞
+            void (*discard)(void* state) noexcept = nullptr;
+            void* discard_ctx = nullptr;
             task_node* next_free = nullptr; ///< 归属"每 worker 空闲链"时的后继
             task_node* next_q = nullptr;    ///< 归属"全局队列溢出链"时的后继
         };

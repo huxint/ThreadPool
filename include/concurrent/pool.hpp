@@ -26,7 +26,8 @@ namespace concurrent {
     /// 关闭策略
     enum class shutdown_policy : std::uint8_t {
         drain,   ///< 排空全部排队任务后退出(析构默认)
-        discard, ///< 丢弃未开始的任务立即退出(对被丢弃任务发取消信号的语义等价物)
+        discard, ///< 丢弃排队任务并以取消语义终结其结果通道; 运行中任务两种
+                 ///  策略下都会等待完成(jthread join 的固有语义)
     };
 
     namespace detail {
@@ -364,6 +365,14 @@ namespace concurrent {
                 });
             };
 
+            // 关闭丢弃路径的终结钩子: 以取消语义收尾共享状态并发布完成,
+            // 使持有 task 句柄的一方经错误通道观测到 operation_cancelled
+            node->discard_ctx = st.get();
+            node->discard = [](void* p) noexcept {
+                static_cast<detail::shared_state<R>*>(p)->set_cancelled();
+                static_cast<detail::shared_state<R>*>(p)->finish();
+            };
+
             if (auto err = route(static_cast<int>(level_of(prio)), node)) {
                 return std::unexpected(*err);
             }
@@ -647,6 +656,9 @@ namespace concurrent {
             // 计数必须随销毁同步扣减: 若留到循环之后, "等待计数归零"与
             // "扣减被销毁节点的计数"互为因果, 将永久自锁
             auto account_drop = [this](node_t* n) noexcept {
+                if (n->discard) {
+                    n->discard(n->discard_ctx); // 先于 body 析构终结其共享状态
+                }
                 destroy_node(n);
                 if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     idle_gen_.fetch_add(1, std::memory_order_release);

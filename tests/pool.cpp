@@ -179,6 +179,26 @@ TEST_SUITE("concurrent.pool") {
         CHECK(ran.load() < 500);
     }
 
+    TEST_CASE("shutdown_discard_finalizes_queued_task_state") {
+        // 被丢弃的 submit 任务: 结果通道必须以 operation_cancelled 终结并
+        // 发布完成, 否则持有句柄的一方 get() 将永久阻塞. 唯一 worker 被闸门
+        // 卡住 -> 任务必然处于排队态; 丢弃先于放行发生, 结局确定
+        pool p({.threads = 1});
+        tu::gate g;
+        g.block_all(p, 1);
+
+        auto submitted = p.submit([] { return 7; });
+        REQUIRE(submitted.has_value());
+
+        std::jthread dropper([&] { p.shutdown(shutdown_policy::discard); });
+        auto r = submitted->get(); // 阻塞至丢弃终结发布完成
+        g.release();               // 放行占位任务, 收敛循环方可在 pending 归零后结束
+        dropper.join();
+
+        REQUIRE(!r.has_value());
+        CHECK(is_cancelled(r.error()));
+    }
+
     TEST_CASE("shutdown_idempotent") {
         pool p({.threads = 2});
         static_cast<void>(p.execute([]() noexcept {}));

@@ -140,7 +140,7 @@ task 组合子(均在完成任务的工作线程上内联执行, 结果值恰好
 | `parallel_map(p, range, f)` | 惰性视图: 不迭代则不提交; `begin()` 整批入队, 按输入顺序阻塞取回 `expected`; 析构等待全部完成 |
 | `parallel_for(p, range, f).run()` | 同上, 无返回值版; `.run()` 直接执行并返回首个错误 |
 | `p.wait()` / `wait_for` / `wait_until` | 阻塞至全部完成 / 超时变体 |
-| `p.shutdown(policy)` | `drain` 排空后退出(析构默认); `discard` 丢弃未开始的任务立即退出 |
+| `p.shutdown(policy)` | `drain` 排空后退出(析构默认); `discard` 丢弃排队任务并以取消语义终结其结果通道; 运行中任务两者都会等待完成(join 固有语义) |
 
 错误辨识: `is_cancelled(e)` 判取消, `submit_error_of(e)` 还原提交阶段失败
 
