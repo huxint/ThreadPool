@@ -44,6 +44,7 @@ namespace concurrent {
      * @tparam F    元素变换体
      */
     template <typename Pool, typename V, typename F>
+        requires std::ranges::input_range<V>
     class parallel_view {
         using elem_ref = std::ranges::range_reference_t<V>;
 
@@ -159,16 +160,24 @@ namespace concurrent {
             return {};
         }
 
-        /// 已成功提交的元素个数(launch 之前为 0)
+        /// 已成功提交(入队)的元素个数(launch 之前为 0); 提交失败的槽位不计入
         [[nodiscard]]
         std::size_t submitted() const noexcept {
-            return slots_.size();
+            std::size_t ok = 0;
+            for (const auto& s : slots_) {
+                if (s.has_value()) {
+                    ++ok;
+                }
+            }
+            return ok;
         }
 
-        /// 整批性失败(存放 slot 的容器自身分配不出来). 迭代时以末尾追加的
-        /// 一个错误元素体现, 故不会被静默吞掉
+        /// 整批性失败(提交期抛出的异常): 容器扩容等分配失败仍经 submit_error
+        /// 承载, 其余异常(F 拷贝/元素搬运/用户迭代器)原样透传, 不误标为 OOM.
+        /// 迭代时以末尾追加的一个错误元素体现, 故不会被静默吞掉
+        /// @return 空指针 = 无整批失败; 可用 concurrent::submit_error_of 辨识提交类失败
         [[nodiscard]]
-        std::optional<submit_error> batch_error() const noexcept {
+        std::exception_ptr batch_error() const noexcept {
             return fatal_;
         }
 
@@ -184,7 +193,7 @@ namespace concurrent {
                 return;
             }
             launched_ = true;
-            // 容器扩容会抛 bad_alloc, 而库表面零 throw -> 就地转错误通道
+            // 库表面零 throw: 提交期一切异常就地转入整批错误通道
             try {
                 if constexpr (std::ranges::sized_range<V>) {
                     slots_.reserve(static_cast<std::size_t>(std::ranges::size(range_)));
@@ -202,8 +211,10 @@ namespace concurrent {
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
-            } catch (...) {
-                fatal_ = submit_error::out_of_memory;
+            } catch (const std::bad_alloc&) {
+                fatal_ = std::make_exception_ptr(submit_error::out_of_memory);
+            } catch (...) { // F 拷贝/元素搬运/用户迭代器抛出: 原样保留, 不误标为 OOM
+                fatal_ = std::current_exception();
             }
         }
 
@@ -226,8 +237,9 @@ namespace concurrent {
         [[nodiscard]]
         value_type fetch(std::size_t i) {
             if (i >= slots_.size()) {
+                // 哨兵位仅在整批失败时可达(count 的定义); 兜底分支防御性保留
                 return std::unexpected(
-                    std::make_exception_ptr(fatal_ ? *fatal_ : submit_error::out_of_memory));
+                    fatal_ ? fatal_ : std::make_exception_ptr(submit_error::out_of_memory));
             }
             auto& s = slots_[i];
             if (!s) {
@@ -244,7 +256,7 @@ namespace concurrent {
         V range_;
         F fn_;
         std::vector<slot_t> slots_;
-        std::optional<submit_error> fatal_;
+        std::exception_ptr fatal_; ///< 整批性失败(提交期); 空 = 无
         bool launched_ = false;
     };
 

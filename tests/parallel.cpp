@@ -149,7 +149,7 @@ TEST_SUITE("concurrent.parallel") {
         }
         CHECK(n == std::size_t{0});
         CHECK(v.submitted() == std::size_t{0});
-        CHECK(!v.batch_error().has_value());
+        CHECK(v.batch_error() == nullptr);
     }
 
     // 区间种类
@@ -314,6 +314,48 @@ TEST_SUITE("concurrent.parallel") {
             }
         }
         CHECK(stopped == std::size_t{5});
+    }
+
+    // 提交失败(池已关)不计入 submitted: 它统计的是真正入队的任务数
+    TEST_CASE("submitted_counts_only_successful_submissions") {
+        pool p({.threads = 2});
+        p.shutdown();
+        std::vector<int> data(5, 1);
+        auto v = parallel_map(p, data, [](int x) { return x; });
+        static_cast<void>(v.run());
+        CHECK(v.submitted() == std::size_t{0});
+    }
+
+    // 提交期非 OOM 异常(此处: 按值搬运元素的拷贝构造抛出)必须原样透传,
+    // 不得被误标为 out_of_memory
+    TEST_CASE("non_oom_submission_failure_preserves_exception") {
+        pool p({.threads = 2});
+        struct throwy {
+            throwy() = default;
+            throwy(const throwy&) { throw std::runtime_error("copy boom"); }
+        };
+        auto rng =
+            std::views::iota(0, 3) | std::views::transform([](int) { return throwy{}; });
+        auto v = parallel_map(p, rng, [](const throwy&) { return 1; });
+
+        std::size_t n = 0;
+        bool saw_boom = false;
+        for (auto&& r : v) {
+            ++n;
+            if (!r.has_value()) {
+                try {
+                    std::rethrow_exception(r.error());
+                } catch (const std::runtime_error& e) {
+                    saw_boom = (e.what() == std::string("copy boom"));
+                } catch (...) {
+                }
+            }
+        }
+        CHECK(n == std::size_t{1}); // 整批失败 -> 仅末尾一个哨兵错误元素
+        CHECK(saw_boom);
+        REQUIRE(v.batch_error() != nullptr); // 迭代触发 launch 后整批错误可见
+        CHECK(!submit_error_of(v.batch_error()).has_value()); // 不是 submit_error 类别
+        CHECK(v.submitted() == std::size_t{0});               // 无一成功提交
     }
 
     // 生命周期
