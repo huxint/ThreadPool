@@ -443,7 +443,7 @@ namespace concurrent {
                         dst->set_exception(first_err);
                     } else {
                         try {
-                            dst->emplace_value(assemble(std::index_sequence_for<Ts...>{}));
+                            dst->emplace_value(assemble());
                         } catch (...) {
                             dst->set_exception(std::current_exception());
                         }
@@ -453,11 +453,12 @@ namespace concurrent {
             }
 
         private:
-            template <std::size_t... I>
+            /// 结构化绑定包(C++26 P1061)展开各槽, 免去 index_sequence 辅助
             [[nodiscard]]
-            std::tuple<Ts...> assemble(std::index_sequence<I...>) noexcept(
+            std::tuple<Ts...> assemble() noexcept(
                 (std::is_nothrow_move_constructible_v<Ts> && ...)) {
-                return std::tuple<Ts...>(std::get<I>(slots).take()...);
+                auto& [...slot] = slots;
+                return std::tuple<Ts...>(slot.take()...);
             }
 
             spinlock lk{};

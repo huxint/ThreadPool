@@ -7,14 +7,12 @@
 namespace concurrent {
 
     /// 任务优先级档位(priority 标签下生效, best-effort 语义)
+    /// 枚举值即层级序: 层索引 = 层数-1-档位(高优先级层号小)
     enum class task_priority : std::uint8_t {
         low = 0,
         normal = 1,
         high = 2,
     };
-
-    /// 决策记录中的历史命名; 与 task_priority 等价
-    using priority_t = task_priority;
 
     namespace detail {
         struct priority_flag {};

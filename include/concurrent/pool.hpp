@@ -15,7 +15,6 @@
 #include <memory>
 #include <mutex>
 #include <new>
-#include <optional>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -40,9 +39,10 @@ namespace concurrent {
             std::array<chase_lev_deque<task_node*, LocalCap>, Levels> local{};
         };
 
-        /// 线程内当前池与 worker 身份(嵌套提交路由用)
-        inline thread_local const void* tls_pool = nullptr;
-        inline thread_local std::size_t tls_worker = 0;
+        /// 线程内当前池与 worker 身份(嵌套提交路由用). constinit: 常量
+        /// 初始化, 免去 TLS 动态初始化守卫检查
+        inline constinit thread_local const void* tls_pool = nullptr;
+        inline constinit thread_local std::size_t tls_worker = 0;
 
         /// MPSC Treiber 压栈(任意线程)/ 单消费者弹出(仅所有者)
         /// 仅单一消费者 -> 无 ABA
@@ -100,6 +100,9 @@ namespace concurrent {
      */
     template <typename... Flags>
     class basic_pool {
+        static_assert((std::size_t{0} + ... + detail::is_worker_cap_flag_v<Flags>) <= 1,
+                      "worker_cap<N> may appear at most once");
+
         static constexpr bool PRIORITY = detail::has_priority_v<Flags...>;
         static constexpr bool TRACE = detail::has_trace_v<Flags...>;
         /// cancellable 标签约束"返回取消源的 execute 重载"的可见性;
@@ -378,8 +381,8 @@ namespace concurrent {
                 static_cast<detail::shared_state<R>*>(p)->finish();
             };
 
-            if (auto err = route(static_cast<int>(level_of(prio)), node)) {
-                return std::unexpected(*err);
+            if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
+                return std::unexpected(ok.error());
             }
 
             trace_enqueue(st->id, prio);
@@ -410,8 +413,8 @@ namespace concurrent {
                 }
             };
 
-            if (auto err = route(static_cast<int>(level_of(prio)), node)) {
-                return std::unexpected(*err);
+            if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
+                return std::unexpected(ok.error());
             }
 
             trace_enqueue(id, prio);
@@ -448,8 +451,8 @@ namespace concurrent {
                 }
             };
 
-            if (auto err = route(static_cast<int>(level_of(prio)), node)) {
-                return std::unexpected(*err);
+            if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
+                return std::unexpected(ok.error());
             }
 
             trace_enqueue(id, prio);
@@ -487,23 +490,26 @@ namespace concurrent {
             }
         }
 
+        /// 入队并唤醒一个 worker
         /// @return 空 = 成功; 非空 = submit_error
-        std::optional<submit_error> route(int level, node_t* node) noexcept {
+        std::expected<void, submit_error> route(int level, node_t* node) noexcept {
             pending_.fetch_add(1, std::memory_order_acq_rel);
             if (stopping_.load(std::memory_order_acquire)) [[unlikely]] {
                 destroy_node(node);
                 pending_.fetch_sub(1, std::memory_order_acq_rel);
-                return submit_error::stopped;
+                return std::unexpected(submit_error::stopped);
             }
 
             // worker 内嵌套提交: 优先本地 deque(LIFO 缓存热度)
             if (detail::tls_pool == this && ctxs_[detail::tls_worker].local[level].push(node))
                 [[likely]] {
-                return notify_wake();
+                notify_wake();
+                return {};
             }
             // 外部提交或本地溢出: 全局队列(环满自动落入溢出链, 永不失败, 永不阻塞)
             (*globals_)[level].push(node);
-            return notify_wake();
+            notify_wake();
+            return {};
         }
 
         /// 执行一个节点并回收. body 在执行后立即析构 - 否则其捕获的实参与
@@ -514,17 +520,14 @@ namespace concurrent {
             detail::freelist_push(ctxs_[worker].free_head, n);
         }
 
-        std::optional<submit_error> notify_wake() noexcept {
+        void notify_wake() noexcept {
             wake_gen_.fetch_add(1, std::memory_order_release);
             wake_gen_.notify_one(); // 单任务只唤醒一个 worker, 避免 notify_all 惊群
-            return std::nullopt;
         }
 
         static constexpr int level_of(task_priority p) noexcept {
-            return PRIORITY ? (p == task_priority::high     ? 0
-                               : p == task_priority::normal ? 1
-                                                            : 2)
-                            : 0;
+            // 枚举 low..high 升序而层索引反向(高优先级层号小): 一行完成映射
+            return PRIORITY ? LEVELS - 1 - static_cast<int>(std::to_underlying(p)) : 0;
         }
 
         node_t* acquire_node() noexcept {
