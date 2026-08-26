@@ -13,6 +13,7 @@
 #include <functional>
 #include <inplace_vector>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <thread>
@@ -308,12 +309,18 @@ namespace concurrent {
         }
 
         /// 关闭. drain: 排空后退出(默认); discard: 丢弃未开始的任务立即退出
+        /// 运行中任务两种策略下都会等待完成(jthread join 的固有语义), discard
+        /// 仅跳过排队任务的执行. 可并发调用: 首个调用者的 policy 生效, 其余
+        /// 调用者阻塞至拆除完成后做一次空收敛
         void shutdown(shutdown_policy policy = shutdown_policy::drain) noexcept {
             const bool first = !stopping_.exchange(true, std::memory_order_acq_rel);
             if (first && policy == shutdown_policy::drain) {
                 wait();
             }
 
+            // drop_all 与 flush_freelists 的空闲链消费依赖"单消费者"前提,
+            // 并发拆除会破坏之; workers_.clear() 更是裸数据竞争 -> 串行化
+            std::lock_guard lock{shutdown_mtx_};
             drop_all_queued(); // discard 的主体; drain 时仅收敛在途提交的残留
             wake_gen_.fetch_add(1, std::memory_order_release);
             wake_gen_.notify_all();
@@ -724,6 +731,9 @@ namespace concurrent {
         alignas(64) mutable std::atomic<std::uint64_t> idle_gen_{0};
         std::atomic<bool> stopping_{false};
         std::atomic<std::uint64_t> id_seq_{0};
+
+        /// 仅拆除路径使用; 与热路径原子量无共享行
+        std::mutex shutdown_mtx_;
 
         std::unique_ptr<worker_ctx_t[]> ctxs_;
         std::conditional_t<WORKER_CAP != 0, std::inplace_vector<std::jthread, WORKER_CAP>,
