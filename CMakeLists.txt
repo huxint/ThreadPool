@@ -1,14 +1,18 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.25)
 
 project(ThreadPool LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 26)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_executable(ThreadPool src/main.cpp)
-target_link_libraries(ThreadPool stdc++exp)
-target_include_directories(ThreadPool PRIVATE include)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
 
-add_executable(test src/test.cpp)
-target_link_libraries(test stdc++exp)
-target_include_directories(test PRIVATE include)
+add_compile_options(-Wall -Wextra -fcontracts)
+add_link_options(-fcontracts)
+
+add_executable(ThreadPool src/main.cpp)
+target_include_directories(ThreadPool PRIVATE include)
