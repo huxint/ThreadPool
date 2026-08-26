@@ -132,10 +132,14 @@ namespace concurrent {
             }
         }
 
-        /// 触发整批提交(幂等), 返回首元素迭代器
+        /// 触发整批提交(幂等), 返回首元素迭代器. 单趟语义: 二次调用返回
+        /// 末尾迭代器 - 首轮迭代已按序消费全部结果, 重入不会重放任务
         [[nodiscard]]
         iterator begin() {
             launch();
+            if (std::exchange(iter_began_, true)) {
+                return iterator{};
+            }
             return iterator{this, 0};
         }
 
@@ -258,6 +262,7 @@ namespace concurrent {
         std::vector<slot_t> slots_;
         std::exception_ptr fatal_; ///< 整批性失败(提交期); 空 = 无
         bool launched_ = false;
+        bool iter_began_ = false; ///< 单趟: begin 只发一次首元素迭代器
     };
 
     /**
