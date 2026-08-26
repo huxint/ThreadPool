@@ -301,10 +301,14 @@ namespace concurrent {
         [[nodiscard]]
         bool wait_until(const std::chrono::time_point<Clock, Dur>& tp) const noexcept {
             while (pending_.load(std::memory_order_acquire) != 0) {
-                if (Clock::now() >= tp) {
+                const auto now = Clock::now();
+                if (now >= tp) {
                     return false;
                 }
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                // 单轮睡眠不超过剩余时限: 到点即刻复检, 不因固定步长过冲
+                std::this_thread::sleep_for(
+                    std::min(std::chrono::duration_cast<std::chrono::nanoseconds>(tp - now),
+                             std::chrono::nanoseconds(100'000)));
             }
             return true;
         }
@@ -389,7 +393,10 @@ namespace concurrent {
             }
 
             auto* self = this;
-            std::uint64_t id = next_id();
+            std::uint64_t id = 0;
+            if constexpr (TRACE) {
+                id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
+            }
             node->body = [self, id, prio, f = std::forward<F>(f),
                           ... a = std::forward<Args>(args)]() mutable noexcept {
                 self->trace_begin(id, prio);
@@ -421,7 +428,10 @@ namespace concurrent {
             // 取消源生命周期随闭包: 调用方句柄失效后任务仍可安全查询
             auto source = std::make_shared<std::stop_source>();
             auto* self = this;
-            std::uint64_t id = next_id();
+            std::uint64_t id = 0;
+            if constexpr (TRACE) {
+                id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
+            }
             node->body = [self, id, prio, source, f = std::forward<F>(f),
                           ... a = std::forward<Args>(args)]() mutable noexcept {
                 self->trace_begin(id, prio);
@@ -741,8 +751,10 @@ namespace concurrent {
         alignas(64) mutable std::atomic<std::int64_t> pending_{0};
         alignas(64) std::atomic<std::uint64_t> wake_gen_{0};
         alignas(64) mutable std::atomic<std::uint64_t> idle_gen_{0};
-        std::atomic<bool> stopping_{false};
-        std::atomic<std::uint64_t> id_seq_{0};
+        /// route 的每次提交都 acquire 读 stopping_; 与高频递增的 id_seq_
+        /// 各占一行, 避免读写互弹缓存行
+        alignas(64) std::atomic<bool> stopping_{false};
+        alignas(64) std::atomic<std::uint64_t> id_seq_{0};
 
         /// 仅拆除路径使用; 与热路径原子量无共享行
         std::mutex shutdown_mtx_;
