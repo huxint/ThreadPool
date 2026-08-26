@@ -568,14 +568,17 @@ namespace concurrent {
             try {
                 auto child = detail::make_state<U>();
                 using node_t = detail::map_cont<state_t, std::decay_t<F>, U>;
-                auto* n = new node_t{{}, child, std::forward<F>(f)};
+                auto* n = new (std::nothrow) node_t{{}, child, std::forward<F>(f)};
+                if (!n) {
+                    return detail::failed_task<U>();
+                }
                 if (!st_->attach(n)) {
                     n->run(*st_); // 父任务已完成: 立即内联
                     delete n;
                 }
                 return task<U>{std::move(child)};
             } catch (...) {
-                return detail::failed_task<U>();
+                return detail::failed_task<U>(); // make_state 的 bad_alloc
             }
         }
 
@@ -590,14 +593,17 @@ namespace concurrent {
             try {
                 auto child = detail::make_state<U>();
                 using node_t = detail::and_then_cont<state_t, std::decay_t<F>, Inner>;
-                auto* n = new node_t{{}, child, std::forward<F>(f)};
+                auto* n = new (std::nothrow) node_t{{}, child, std::forward<F>(f)};
+                if (!n) {
+                    return detail::failed_task<U>();
+                }
                 if (!st_->attach(n)) {
                     n->run(*st_); // 父任务已完成: 立即内联
                     delete n;
                 }
                 return task<U>{std::move(child)};
             } catch (...) {
-                return detail::failed_task<U>();
+                return detail::failed_task<U>(); // make_state 的 bad_alloc
             }
         }
 
@@ -610,14 +616,17 @@ namespace concurrent {
             try {
                 auto child = detail::make_state<T>();
                 using node_t = detail::inspect_cont<state_t, std::decay_t<F>>;
-                auto* n = new node_t{{}, child, std::forward<F>(f)};
+                auto* n = new (std::nothrow) node_t{{}, child, std::forward<F>(f)};
+                if (!n) {
+                    return detail::failed_task<T>();
+                }
                 if (!st_->attach(n)) {
                     n->run(*st_); // 父任务已完成: 立即内联
                     delete n;
                 }
                 return task<T>{std::move(child)};
             } catch (...) {
-                return detail::failed_task<T>();
+                return detail::failed_task<T>(); // make_state 的 bad_alloc
             }
         }
 
@@ -669,7 +678,12 @@ namespace concurrent {
                     }
                     using parent_t = detail::shared_state<TIn>;
                     using node_t = detail::deposit_cont<I, parent_t, core_t>;
-                    auto* n = new node_t{{}, core};
+                    auto* n = new (std::nothrow) node_t{{}, core};
+                    if (!n) { // 单槽 OOM 降级为该槽失败, 不放大为整批失败
+                        core->record_error(std::make_exception_ptr(std::bad_alloc{}));
+                        core->settle_one();
+                        return;
+                    }
                     if (!t.st_->attach(n)) {
                         n->run(*t.st_); // 已完成: 内联沉淀
                         delete n;
