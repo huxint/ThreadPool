@@ -94,7 +94,7 @@ namespace concurrent::detail {
 
     private:
         alignas(64) std::atomic<std::size_t> bottom_{0}; ///< 仅所有者写
-        alignas(64) std::atomic<std::size_t> top_{0}; ///< 所有者与窃取者竞争
+        alignas(64) std::atomic<std::size_t> top_{0};    ///< 所有者与窃取者竞争
         std::array<std::atomic<T>, Capacity> slots_{};
     };
 

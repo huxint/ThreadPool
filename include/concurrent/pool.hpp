@@ -24,7 +24,7 @@ namespace concurrent {
 
     /// 关闭策略
     enum class shutdown_policy : std::uint8_t {
-        drain, ///< 排空全部排队任务后退出(析构默认)
+        drain,   ///< 排空全部排队任务后退出(析构默认)
         discard, ///< 丢弃未开始的任务立即退出(对被丢弃任务发取消信号的语义等价物)
     };
 
@@ -124,7 +124,7 @@ namespace concurrent {
     public:
         struct options {
             std::size_t threads = 0; ///< 0 -> hardware_concurrency()
-            trace_hooks hooks{}; ///< 仅 trace 标签下生效
+            trace_hooks hooks{};     ///< 仅 trace 标签下生效
         };
 
         /**

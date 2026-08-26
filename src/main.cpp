@@ -14,7 +14,8 @@ int main() {
 
     // 即发即忘(callable 需 noexcept)
     std::atomic<int> fire{0};
-    static_cast<void>(p.execute([&fire]() noexcept { fire.fetch_add(1, std::memory_order_relaxed); }));
+    static_cast<void>(
+        p.execute([&fire]() noexcept { fire.fetch_add(1, std::memory_order_relaxed); }));
     p.wait();
     std::println("fire-and-forget count: {}", fire.load());
 
@@ -69,20 +70,19 @@ int main() {
 
     // 带优先级(callable 需 noexcept)
     basic_pool<decltype(priority)> prio_pool({.threads = 2});
-    static_cast<void>(prio_pool.execute(task_priority::low, []() noexcept { std::println("low-priority task"); }));
-    static_cast<void>(prio_pool.execute(task_priority::high, []() noexcept { std::println("high-priority task"); }));
+    static_cast<void>(
+        prio_pool.execute(task_priority::low, []() noexcept { std::println("low-priority task"); }));
+    static_cast<void>(
+        prio_pool.execute(task_priority::high, []() noexcept { std::println("high-priority task"); }));
     prio_pool.wait();
 
     // trace 钩子: 三阶段事件流(enqueue / begin / end)
     basic_pool<decltype(trace)> traced(
         {.threads = 2,
-         .hooks = {.on_enqueue = {},
-                   .on_begin = {},
-                   .on_end =
-                       [](trace_event e) noexcept {
-                           std::println("[trace] task {} finished, outcome {}", e.id,
-                                        static_cast<int>(e.outcome));
-                       }}});
+         .hooks = {.on_enqueue = {}, .on_begin = {}, .on_end = [](trace_event e) noexcept {
+                       std::println("[trace] task {} finished, outcome {}", e.id,
+                                    static_cast<int>(e.outcome));
+                   }}});
     static_cast<void>(traced.execute([]() noexcept {}));
     traced.wait();
 

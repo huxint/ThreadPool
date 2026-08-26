@@ -116,8 +116,10 @@ namespace concurrent {
         /// 返回语句中的 prvalue 初始化仍受强制省略保障, `auto v = parallel_map(...)` 照常可用
         parallel_view(const parallel_view&) =
             delete ("parallel_view is not copyable: closures capture its interior address");
-        parallel_view& operator=(const parallel_view&) = delete ("parallel_view is not copy-assignable");
-        parallel_view(parallel_view&&) = delete ("parallel_view is not movable: closures capture its interior address");
+        parallel_view&
+        operator=(const parallel_view&) = delete ("parallel_view is not copy-assignable");
+        parallel_view(parallel_view&&) =
+            delete ("parallel_view is not movable: closures capture its interior address");
         parallel_view& operator=(parallel_view&&) = delete ("parallel_view is not move-assignable");
 
         /// 阻塞至全部已提交任务完成 - 闭包引用的 f 与元素指针在此之后才可失效

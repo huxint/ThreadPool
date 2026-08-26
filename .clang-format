@@ -1,17 +1,13 @@
----
-# ThreadPool / concurrent 项目统一风格
-#
-# 核心约束：
-#   * if / else / for / while 等控制语句无论主体多短都必须带花括号
-#     （InsertBraces 会自动补上缺失的括号，防止单行语句被误改后语义漂移）
-#   * 4 空格缩进、100 列限宽、命名空间内容缩进 —— 与库内既有代码一致
+# ThreadPool 统一风格
+# 核心约束:
+# - 控制语句无论主体多短都带花括号(InsertBraces 自动补全, 防止单行语句被误改后语义漂移)
+# - 行尾注释对齐, 变量与赋值不对齐
+# - 4 空格缩进, 100 列限宽, 命名空间内容缩进
 Language: Cpp
 BasedOnStyle: LLVM
 
-# ------------------------------------------------------------ 语言标准
-Standard: c++26
+Standard: Latest
 
-# ------------------------------------------------------------ 缩进与列宽
 ColumnLimit: 100
 IndentWidth: 4
 TabWidth: 4
@@ -19,31 +15,22 @@ UseTab: Never
 AccessModifierOffset: -4
 NamespaceIndentation: All
 
-# ------------------------------------------------------------ 括号策略
 BreakBeforeBraces: Attach
-InsertBraces: true          # 单行 if/for/while 主体自动补 {}
-RemoveBracesLLVM: false     # 绝不删除已有括号
+InsertBraces: true
+RemoveBracesLLVM: false
 AllowShortIfStatementsOnASingleLine: Never
 AllowShortLoopsOnASingleLine: false
 
-# ------------------------------------------------------------ 声明布局
-BreakTemplateDeclarations: Yes   # template <...> 之后总是换行
-BreakAfterAttributes: Always     # [[attribute]] 之后总是换行
+BreakTemplateDeclarations: Yes
+BreakAfterAttributes: Always
 
-# ------------------------------------------------------------ 对齐
-AlignTrailingComments: false     # 行尾注释不相互对齐，避免大段填充空格
+AlignTrailingComments: true
 AlignConsecutiveAssignments: None
 AlignConsecutiveDeclarations: None
 
-# ------------------------------------------------------------ 指针对齐
-PointerAlignment: Left      # int* p（与库内多数代码一致）
+PointerAlignment: Left
 DerivePointerAlignment: false
 
-# ------------------------------------------------------------ 折行偏好
-AllowShortFunctionsOnASingleLine: Inline   # 类内短函数保持单行
+AllowShortFunctionsOnASingleLine: Inline
 BinPackArguments: true
 BinPackParameters: true
-
-# ------------------------------------------------------------ 头文件
-SortIncludes: CaseSensitive
-IncludeBlocks: Preserve

@@ -66,8 +66,8 @@ namespace {
     }
 
     void throughput_header() {
-        std::println("{:<{}} {:>16} {:>16} {:>14} {:>10}", "case", NAME_W, "Taskflow",
-                     "BS", "ours", "vs best");
+        std::println("{:<{}} {:>16} {:>16} {:>14} {:>10}", "case", NAME_W, "Taskflow", "BS", "ours",
+                     "vs best");
     }
 
     void throughput_row(std::string_view name, double tf_mops, double bs_mops, double our_mops) {
@@ -78,8 +78,8 @@ namespace {
 
     void time_row(std::string_view name, double tf_ms, double bs_ms, double our_ms) {
         const double base = std::max(1e-12, std::min(tf_ms, bs_ms));
-        std::println("{:<{}} {:>14.2f} {:>14.2f} {:>14.2f} {:>8.2f}x", name, NAME_W, tf_ms,
-                     bs_ms, our_ms, our_ms > 0 ? base / our_ms : 0.0);
+        std::println("{:<{}} {:>14.2f} {:>14.2f} {:>14.2f} {:>8.2f}x", name, NAME_W, tf_ms, bs_ms,
+                     our_ms, our_ms > 0 ? base / our_ms : 0.0);
     }
 
     void latency_row(std::string_view tag, double tf_us, double bs_us, double our_us) {
@@ -96,7 +96,7 @@ namespace {
     }
 
     constexpr std::uint64_t LONG_ITERS = 20'000; // 长任务实算量(约数十微秒)
-    constexpr std::uint64_t SHORT_ITERS = 100; // 短任务实算量(亚微秒级)
+    constexpr std::uint64_t SHORT_ITERS = 100;   // 短任务实算量(亚微秒级)
 
     // 特性组合吞吐: 以 execute 单生产者为统一负载, 度量各标签组合的调度开销
     template <typename Pool>
@@ -110,7 +110,8 @@ namespace {
         std::atomic<std::size_t> n{0};
         const auto t0 = clk::now();
         for (std::size_t i = 0; i < count; ++i) {
-            static_cast<void>(p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
+            static_cast<void>(
+                p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
         }
         wait_count(n, count);
 
@@ -139,9 +140,7 @@ int main(int argc, char** argv) {
     throughput_header();
     {
         const std::size_t count = 500'000 / scale;
-        const auto mops_of = [&](double secs) {
-            return static_cast<double>(count) / secs / 1e6;
-        };
+        const auto mops_of = [&](double secs) { return static_cast<double>(count) / secs / 1e6; };
 
         const double tf = mops_of(best_seconds(reps, [&] {
             tf::Executor ex(threads);
@@ -163,8 +162,8 @@ int main(int argc, char** argv) {
             pool p({.threads = threads});
             std::atomic<std::size_t> n{0};
             for (std::size_t i = 0; i < count; ++i) {
-                static_cast<void>(p.execute(
-                    [&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
+                static_cast<void>(
+                    p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
             }
             wait_count(n, count);
         }));
@@ -177,9 +176,7 @@ int main(int argc, char** argv) {
     throughput_header();
     {
         const std::size_t count = 200'000 / scale;
-        const auto mops_of = [&](double secs) {
-            return static_cast<double>(count) / secs / 1e6;
-        };
+        const auto mops_of = [&](double secs) { return static_cast<double>(count) / secs / 1e6; };
 
         const double tf = mops_of(best_seconds(reps, [&] {
             tf::Executor ex(threads);
@@ -258,8 +255,8 @@ int main(int argc, char** argv) {
                     return;
                 }
                 for (int i = 0; i < 2; ++i) {
-                    static_cast<void>(p.execute(
-                        [&p, &leaves, d]() noexcept { go(p, leaves, d - 1); }));
+                    static_cast<void>(
+                        p.execute([&p, &leaves, d]() noexcept { go(p, leaves, d - 1); }));
                 }
             }
         };
@@ -292,9 +289,7 @@ int main(int argc, char** argv) {
     for (const std::size_t producers : {std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
         const std::size_t each = 100'000 / scale;
         const std::size_t total = producers * each;
-        const auto mops_of = [&](double secs) {
-            return static_cast<double>(total) / secs / 1e6;
-        };
+        const auto mops_of = [&](double secs) { return static_cast<double>(total) / secs / 1e6; };
 
         const auto run = [&](auto make_pool, auto produce) {
             return best_seconds(reps, [&] {
@@ -311,28 +306,28 @@ int main(int argc, char** argv) {
             });
         };
 
-        const double tf = mops_of(run(
-            [&] { return tf::Executor(threads); },
-            [](auto& ex, auto& n, std::size_t cnt) {
-                for (std::size_t i = 0; i < cnt; ++i) {
-                    ex.silent_async([&n] { n.fetch_add(1, std::memory_order_relaxed); });
-                }
-            }));
-        const double bs = mops_of(run(
-            [&] { return BS::thread_pool(threads); },
-            [](auto& p, auto& n, std::size_t cnt) {
-                for (std::size_t i = 0; i < cnt; ++i) {
-                    p.detach_task([&n] { n.fetch_add(1, std::memory_order_relaxed); });
-                }
-            }));
-        const double ours = mops_of(run(
-            [&] { return pool({.threads = threads}); },
-            [](auto& p, auto& n, std::size_t cnt) {
-                for (std::size_t i = 0; i < cnt; ++i) {
-                    static_cast<void>(p.execute(
-                        [&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
-                }
-            }));
+        const double tf = mops_of(
+            run([&] { return tf::Executor(threads); },
+                [](auto& ex, auto& n, std::size_t cnt) {
+                    for (std::size_t i = 0; i < cnt; ++i) {
+                        ex.silent_async([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+                    }
+                }));
+        const double bs =
+            mops_of(run([&] { return BS::thread_pool(threads); },
+                        [](auto& p, auto& n, std::size_t cnt) {
+                            for (std::size_t i = 0; i < cnt; ++i) {
+                                p.detach_task([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+                            }
+                        }));
+        const double ours = mops_of(run([&] { return pool({.threads = threads}); },
+                                        [](auto& p, auto& n, std::size_t cnt) {
+                                            for (std::size_t i = 0; i < cnt; ++i) {
+                                                static_cast<void>(p.execute([&n]() noexcept {
+                                                    n.fetch_add(1, std::memory_order_relaxed);
+                                                }));
+                                            }
+                                        }));
         throughput_row(std::format("{} producers", producers), tf, bs, ours);
     }
 
@@ -368,25 +363,23 @@ int main(int argc, char** argv) {
             for (std::size_t i = 0; i < samples; ++i) {
                 const auto t0 = clk::now();
                 once(p);
-                us.push_back(
-                    std::chrono::duration<double, std::micro>(clk::now() - t0).count());
+                us.push_back(std::chrono::duration<double, std::micro>(clk::now() - t0).count());
             }
             return summarize(std::move(us));
         };
 
-        const latency tf = roundtrip(
-            [&] { return tf::Executor(threads); },
-            [](auto& ex) { static_cast<void>(ex.async([] { return 0; }).get()); });
-        const latency bs = roundtrip(
-            [&] { return BS::thread_pool(threads); },
-            [](auto& p) { static_cast<void>(p.submit_task([] { return 0; }).get()); });
-        const latency ours = roundtrip(
-            [&] { return pool({.threads = threads}); },
-            [](auto& p) {
-                if (auto t = p.submit([] { return 0; })) {
-                    static_cast<void>(t->get());
-                }
-            });
+        const latency tf =
+            roundtrip([&] { return tf::Executor(threads); },
+                      [](auto& ex) { static_cast<void>(ex.async([] { return 0; }).get()); });
+        const latency bs =
+            roundtrip([&] { return BS::thread_pool(threads); },
+                      [](auto& p) { static_cast<void>(p.submit_task([] { return 0; }).get()); });
+        const latency ours = roundtrip([&] { return pool({.threads = threads}); },
+                                       [](auto& p) {
+                                           if (auto t = p.submit([] { return 0; })) {
+                                               static_cast<void>(t->get());
+                                           }
+                                       });
 
         std::println("{:<{}} {:>14} {:>14} {:>14}", "quantile", NAME_W, "Taskflow", "BS", "ours");
         latency_row("P50", tf.p50, bs.p50, ours.p50);
@@ -410,36 +403,44 @@ int main(int argc, char** argv) {
             }
         }
         const auto body = [](unsigned char kind, auto& done) {
-            volatile double sink =
-                spin_work(kind == 0 ? SHORT_ITERS : LONG_ITERS);
+            volatile double sink = spin_work(kind == 0 ? SHORT_ITERS : LONG_ITERS);
             static_cast<void>(sink);
             done.fetch_add(1, std::memory_order_relaxed);
         };
 
-        const double tf = best_seconds(reps, [&] {
-            tf::Executor ex(threads);
-            std::atomic<std::size_t> n{0};
-            for (auto kind : plan) {
-                ex.silent_async([&n, kind, &body] { body(kind, n); });
-            }
-            wait_count(n, total);
-        }) * 1e3;
-        const double bs = best_seconds(reps, [&] {
-            BS::thread_pool p(threads);
-            std::atomic<std::size_t> n{0};
-            for (auto kind : plan) {
-                p.detach_task([&n, kind, &body] { body(kind, n); });
-            }
-            wait_count(n, total);
-        }) * 1e3;
-        const double ours = best_seconds(reps, [&] {
-            pool p({.threads = threads});
-            std::atomic<std::size_t> n{0};
-            for (auto kind : plan) {
-                static_cast<void>(p.execute([&n, kind, &body]() noexcept { body(kind, n); }));
-            }
-            wait_count(n, total);
-        }) * 1e3;
+        const double tf =
+            best_seconds(reps,
+                         [&] {
+                             tf::Executor ex(threads);
+                             std::atomic<std::size_t> n{0};
+                             for (auto kind : plan) {
+                                 ex.silent_async([&n, kind, &body] { body(kind, n); });
+                             }
+                             wait_count(n, total);
+                         }) *
+            1e3;
+        const double bs = best_seconds(reps,
+                                       [&] {
+                                           BS::thread_pool p(threads);
+                                           std::atomic<std::size_t> n{0};
+                                           for (auto kind : plan) {
+                                               p.detach_task([&n, kind, &body] { body(kind, n); });
+                                           }
+                                           wait_count(n, total);
+                                       }) *
+                          1e3;
+        const double ours =
+            best_seconds(reps,
+                         [&] {
+                             pool p({.threads = threads});
+                             std::atomic<std::size_t> n{0};
+                             for (auto kind : plan) {
+                                 static_cast<void>(
+                                     p.execute([&n, kind, &body]() noexcept { body(kind, n); }));
+                             }
+                             wait_count(n, total);
+                         }) *
+            1e3;
         time_row("90% short + 10% long", tf, bs, ours);
     }
 
@@ -454,36 +455,39 @@ int main(int argc, char** argv) {
             done.fetch_add(1, std::memory_order_relaxed);
         };
         const auto load = [&](std::size_t t, auto make_pool, auto submit_chunk) {
-            return best_seconds(reps, [&] {
-                auto p = make_pool(t);
-                std::atomic<std::size_t> done{0};
-                for (std::size_t i = 0; i < chunks; ++i) {
-                    submit_chunk(p, done);
-                }
-                wait_count(done, chunks);
-            }) * 1e3;
+            return best_seconds(reps,
+                                [&] {
+                                    auto p = make_pool(t);
+                                    std::atomic<std::size_t> done{0};
+                                    for (std::size_t i = 0; i < chunks; ++i) {
+                                        submit_chunk(p, done);
+                                    }
+                                    wait_count(done, chunks);
+                                }) *
+                   1e3;
         };
 
         std::size_t shown = 0; // threads 与列表前几项重合时跳过重复行
-        for (const std::size_t t :
-             {std::size_t{1}, std::size_t{2}, std::size_t{4}, threads}) {
+        for (const std::size_t t : {std::size_t{1}, std::size_t{2}, std::size_t{4}, threads}) {
             if (t > hw || t == shown) {
                 continue;
             }
             shown = t;
-            const double tf = load(t, [](std::size_t n) { return tf::Executor(n); },
-                                   [&](auto& ex, auto& done) {
-                                       ex.silent_async(
-                                           [&done, chunk_body] { chunk_body(done); });
-                                   });
-            const double bs = load(t, [](std::size_t n) { return BS::thread_pool(n); },
-                                   [&](auto& p, auto& done) {
-                                       p.detach_task([&done, chunk_body] { chunk_body(done); });
-                                   });
+            const double tf = load(
+                t, [](std::size_t n) { return tf::Executor(n); },
+                [&](auto& ex, auto& done) {
+                    ex.silent_async([&done, chunk_body] { chunk_body(done); });
+                });
+            const double bs = load(
+                t, [](std::size_t n) { return BS::thread_pool(n); },
+                [&](auto& p, auto& done) {
+                    p.detach_task([&done, chunk_body] { chunk_body(done); });
+                });
             const double ours = load(
                 t, [](std::size_t n) { return pool({.threads = n}); },
                 [&](auto& p, auto& done) {
-                    static_cast<void>(p.execute([&done, chunk_body]() noexcept { chunk_body(done); }));
+                    static_cast<void>(
+                        p.execute([&done, chunk_body]() noexcept { chunk_body(done); }));
                 });
             time_row(std::format("{} threads", t), tf, bs, ours);
         }
@@ -499,17 +503,15 @@ int main(int argc, char** argv) {
         using cancel_pool = concurrent::basic_pool<decltype(concurrent::cancellable)>;
         using trace_pool = concurrent::basic_pool<decltype(concurrent::trace)>;
         using capped_pool = concurrent::basic_pool<decltype(concurrent::worker_cap<8>)>;
-        using all_pool = concurrent::basic_pool<decltype(concurrent::priority),
-                                                decltype(concurrent::cancellable),
-                                                decltype(concurrent::trace),
-                                                decltype(concurrent::worker_cap<8>)>;
+        using all_pool =
+            concurrent::basic_pool<decltype(concurrent::priority),
+                                   decltype(concurrent::cancellable), decltype(concurrent::trace),
+                                   decltype(concurrent::worker_cap<8>)>;
 
         // 各组合的测量闭包; 交错采样让它们在相近的系统状态下被测量
         const std::vector<std::pair<std::string_view, std::function<double(std::size_t)>>> combos =
-            {{"no flags",
-              [&](std::size_t c) { return fire_rate_mops<pool>(threads, c); }},
-             {"+ priority",
-              [&](std::size_t c) { return fire_rate_mops<prio_pool>(threads, c); }},
+            {{"no flags", [&](std::size_t c) { return fire_rate_mops<pool>(threads, c); }},
+             {"+ priority", [&](std::size_t c) { return fire_rate_mops<prio_pool>(threads, c); }},
              {"+ cancellable",
               [&](std::size_t c) { return fire_rate_mops<cancel_pool>(threads, c); }},
              {"+ trace no hooks",
@@ -522,8 +524,7 @@ int main(int argc, char** argv) {
               }},
              {"+ worker_cap<8>",
               [&](std::size_t c) { return fire_rate_mops<capped_pool>(threads, c); }},
-             {"all flags",
-              [&](std::size_t c) { return fire_rate_mops<all_pool>(threads, c); }}};
+             {"all flags", [&](std::size_t c) { return fire_rate_mops<all_pool>(threads, c); }}};
 
         struct combo_row {
             std::string_view name;
@@ -555,12 +556,14 @@ int main(int argc, char** argv) {
     {
         std::vector<std::uint64_t> data(quick ? 64 : 512, LONG_ITERS);
         const double ours =
-            best_seconds(reps, [&] {
-                pool p({.threads = threads});
-                auto v = concurrent::parallel_map(p, data,
-                                                  [](std::uint64_t k) { return spin_work(k); });
-                static_cast<void>(v.run());
-            }) * 1e3;
+            best_seconds(reps,
+                         [&] {
+                             pool p({.threads = threads});
+                             auto v = concurrent::parallel_map(
+                                 p, data, [](std::uint64_t k) { return spin_work(k); });
+                             static_cast<void>(v.run());
+                         }) *
+            1e3;
         std::println("{:<{}} {:>14.2f}", "parallel_map full run", NAME_W, ours);
     }
 

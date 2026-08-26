@@ -18,7 +18,7 @@ namespace concurrent {
 
     /// 提交失败的错误类别
     enum class submit_error : std::uint8_t {
-        stopped, ///< 池已关闭, 拒绝新任务
+        stopped,       ///< 池已关闭, 拒绝新任务
         out_of_memory, ///< 内部分配失败(库内唯一允许 catch 的位置)
     };
 
@@ -74,7 +74,7 @@ namespace concurrent {
         struct task_node {
             sbo_function<64> body;
             task_node* next_free = nullptr; ///< 归属"每 worker 空闲链"时的后继
-            task_node* next_q = nullptr; ///< 归属"全局队列溢出链"时的后继
+            task_node* next_q = nullptr;    ///< 归属"全局队列溢出链"时的后继
         };
 
         /// 续延节点: 任务完成时被内联执行一次的类型擦除回调
@@ -124,7 +124,7 @@ namespace concurrent {
         public:
             using value_type = T;
 
-            std::uint64_t id = 0; ///< trace 任务编号
+            std::uint64_t id = 0;      ///< trace 任务编号
             std::stop_source source{}; ///< 取消源; 非取消提交时不可触发
 
             /// 完成路径(任务体外壳恰好调用一次)
@@ -244,7 +244,6 @@ namespace concurrent {
         std::shared_ptr<shared_state<T>> make_state() {
             return std::make_shared<shared_state<T>>(); // bad_alloc 由边界捕获
         }
-
 
         template <typename ParentState, typename F, typename U>
         struct map_cont final : cont_impl<ParentState, map_cont<ParentState, F, U>> {
@@ -371,7 +370,6 @@ namespace concurrent {
                 }
             }
         };
-
 
         template <typename T>
         struct slot_store {

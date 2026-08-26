@@ -121,9 +121,8 @@ namespace concurrent::detail {
         }
 
     private:
-        alignas(
-            std::max_align_t) std::byte storage_[SboBytes > sizeof(void*) ? SboBytes
-                                                                              : sizeof(void*)]{};
+        alignas(std::max_align_t)
+            std::byte storage_[SboBytes > sizeof(void*) ? SboBytes : sizeof(void*)]{};
         const vtable* vt_ = nullptr;
     };
 

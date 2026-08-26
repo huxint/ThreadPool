@@ -67,7 +67,7 @@ TEST_SUITE("concurrent.task") {
         pool p({.threads = 2});
         auto t = p.submit([] { return 5; });
         REQUIRE(t.has_value());
-        t->wait();                 // 先等它跑完
+        t->wait();                                    // 先等它跑完
         auto m = t->map([](int v) { return v * v; }); // 再附着 => 走内联路径
         CHECK(m.get().value_or(-1) == 25);
     }

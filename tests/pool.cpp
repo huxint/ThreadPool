@@ -141,7 +141,8 @@ TEST_SUITE("concurrent.pool") {
         {
             pool p({.threads = 4});
             for (int i = 0; i < 2000; ++i) {
-                static_cast<void>(p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
+                static_cast<void>(
+                    p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
             }
         } // 析构 -> shutdown(drain)
         CHECK(ran.load() == 2000);
@@ -151,7 +152,8 @@ TEST_SUITE("concurrent.pool") {
         std::atomic<int> ran{0};
         pool p({.threads = 3});
         for (int i = 0; i < 1000; ++i) {
-            static_cast<void>(p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
+            static_cast<void>(
+                p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
         }
         p.shutdown(shutdown_policy::drain);
         CHECK(ran.load() == 1000);
@@ -164,7 +166,8 @@ TEST_SUITE("concurrent.pool") {
         g.block_all(p, 1);
 
         for (int i = 0; i < 500; ++i) {
-            static_cast<void>(p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
+            static_cast<void>(
+                p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
         }
 
         // discard 不等待排空, 但 join worker 前须先放行闸门
@@ -429,7 +432,8 @@ TEST_SUITE("concurrent.pool") {
 
         std::atomic<int> n{0};
         for (int i = 0; i < 100; ++i) {
-            static_cast<void>(p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
+            static_cast<void>(
+                p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
         }
         p.wait();
         CHECK(n.load() == 100);
@@ -477,7 +481,8 @@ TEST_SUITE("concurrent.pool") {
                     return;
                 }
                 for (int i = 0; i < 2; ++i) {
-                    static_cast<void>(p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); }));
+                    static_cast<void>(
+                        p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); }));
                 }
             }
         };
@@ -534,7 +539,8 @@ TEST_SUITE("concurrent.pool") {
         pool p({.threads = 1});
         std::vector<int> order;
         for (int i = 0; i < 100; ++i) {
-            static_cast<void>(p.execute([&order, i]() noexcept { order.push_back(i); })); // 单 worker 免锁
+            static_cast<void>(
+                p.execute([&order, i]() noexcept { order.push_back(i); })); // 单 worker 免锁
         }
         p.wait();
 
