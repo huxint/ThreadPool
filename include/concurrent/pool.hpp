@@ -155,6 +155,7 @@ namespace concurrent {
                 ctxs_[i].index = i;
             }
             try {
+                globals_ = std::make_unique<std::array<gq_t, LEVELS>>();
                 spawn_workers();
             } catch (...) {
                 // 已就位的 worker 只在看到 stopping_ 后才退出循环; 若跳过这步,
@@ -501,7 +502,7 @@ namespace concurrent {
                 return notify_wake();
             }
             // 外部提交或本地溢出: 全局队列(环满自动落入溢出链, 永不失败, 永不阻塞)
-            globals_[level].push(node);
+            (*globals_)[level].push(node);
             return notify_wake();
         }
 
@@ -611,7 +612,7 @@ namespace concurrent {
                 }
             }
             for (int lv = 0; lv < LEVELS; ++lv) {
-                if (auto* n = globals_[lv].pop()) {
+                if (auto* n = (*globals_)[lv].pop()) {
                     return n;
                 }
             }
@@ -635,7 +636,7 @@ namespace concurrent {
         [[nodiscard]]
         bool any_work_hint() const noexcept {
             for (int lv = 0; lv < LEVELS; ++lv) {
-                if (globals_[lv].size_approx()) {
+                if ((*globals_)[lv].size_approx()) {
                     return true;
                 }
             }
@@ -680,7 +681,7 @@ namespace concurrent {
             while (quiet_rounds < 2) {
                 std::size_t got = 0;
                 for (int lv = 0; lv < LEVELS; ++lv) {
-                    while (auto* n = globals_[lv].pop()) {
+                    while (auto* n = (*globals_)[lv].pop()) {
                         account_drop(n);
                         ++got;
                     }
@@ -763,7 +764,9 @@ namespace concurrent {
         std::conditional_t<WORKER_CAP != 0, std::inplace_vector<std::jthread, WORKER_CAP>,
                            std::vector<std::jthread>>
             workers_;
-        std::array<gq_t, LEVELS> globals_{};
+        /// 全局环体积可观(16384 槽 x 64B ≈ 1MiB/层), 堆分配以保持池对象
+        /// 本身可安全栈上构造; 热路径仅多一次指针解引用
+        std::unique_ptr<std::array<gq_t, LEVELS>> globals_;
         trace_hooks hooks_;
         std::size_t n_threads_ = 0;
     };
