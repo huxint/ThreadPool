@@ -51,7 +51,7 @@ C++26 高性能线程池: 工作窃取调度 + 无锁队列 + 函数式任务组
 | + worker_cap&lt;8&gt; | 2.60 | 1.05x |
 | 全部组合 | 2.53 | 1.02x |
 
-> 参考环境: GCC 16.2, 16 硬件线程, 基准线程数 8. 数值随时段波动, `./build/tp_bench [--quick]` 复现
+> 参考环境: GCC 16.2, 16 硬件线程, 基准线程数 8. 数值随时段波动, `./build/concurrent_bench [--quick]` 复现
 > 延迟优势的关键设计: worker 睡眠前执行时间预算型有界自旋(默认 64us), 吸收成簇到达的任务, 免去 futex 内核往返
 
 ## 功能一览
@@ -164,9 +164,9 @@ task 组合子(均在完成任务的工作线程上内联执行, 结果值恰好
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-ctest --test-dir build      # 测试
-./build/example             # 示例
-./build/tp_bench            # 基准(--quick 缩减规模)
+ctest --test-dir build          # 测试
+./build/concurrent_example      # 示例
+./build/concurrent_bench        # 基准(--quick 缩减规模)
 ```
 
 | 选项 | 说明 |

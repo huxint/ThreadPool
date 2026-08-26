@@ -30,18 +30,18 @@ target_compile_options(
     -fcontracts $<IF:$<CONFIG:Debug>,-fcontract-evaluation-semantic=enforce,-fcontract-evaluation-semantic=ignore>)
 target_link_options(concurrent INTERFACE -fcontracts)
 
-add_executable(example src/main.cpp)
-target_link_libraries(example PRIVATE concurrent)
+add_executable(concurrent_example src/main.cpp)
+target_link_libraries(concurrent_example PRIVATE concurrent)
 
-add_executable(tp_tests tests/main.cpp tests/pool.cpp tests/task.cpp tests/parallel.cpp
-                        tests/detail.cpp)
-target_link_libraries(tp_tests PRIVATE concurrent)
-target_include_directories(tp_tests PRIVATE tests tests/third_party)
-add_test(NAME tp_tests COMMAND tp_tests)
+add_executable(concurrent_tests tests/main.cpp tests/pool.cpp tests/task.cpp tests/parallel.cpp
+                                tests/detail.cpp)
+target_link_libraries(concurrent_tests PRIVATE concurrent)
+target_include_directories(concurrent_tests PRIVATE tests tests/third_party)
+add_test(NAME concurrent_tests COMMAND concurrent_tests)
 
-add_executable(tp_bench benchmarks/bench.cpp)
-target_link_libraries(tp_bench PRIVATE concurrent)
-target_include_directories(tp_bench PRIVATE benchmarks benchmarks/third_party/taskflow_repo)
+add_executable(concurrent_bench benchmarks/bench.cpp)
+target_link_libraries(concurrent_bench PRIVATE concurrent)
+target_include_directories(concurrent_bench PRIVATE benchmarks benchmarks/third_party/taskflow_repo)
 
 # -DBUILD_MODULE=ON: module wrapper `concurrent.pool` (requires Ninja)
 option(BUILD_MODULE "build the concurrent.pool module wrapper" OFF)
@@ -51,13 +51,13 @@ if(BUILD_MODULE)
     target_link_libraries(concurrent_module PUBLIC concurrent)
     set_target_properties(concurrent_module PROPERTIES CXX_SCAN_FOR_MODULES ON)
 
-    add_executable(tp_module_smoke module/smoke.cpp)
-    target_link_libraries(tp_module_smoke PRIVATE concurrent_module)
-    set_target_properties(tp_module_smoke PROPERTIES CXX_SCAN_FOR_MODULES ON)
-    add_test(NAME tp_module_smoke COMMAND tp_module_smoke)
+    add_executable(concurrent_module_smoke module/smoke.cpp)
+    target_link_libraries(concurrent_module_smoke PRIVATE concurrent_module)
+    set_target_properties(concurrent_module_smoke PROPERTIES CXX_SCAN_FOR_MODULES ON)
+    add_test(NAME concurrent_module_smoke COMMAND concurrent_module_smoke)
 endif()
 
 if(SANITIZER STREQUAL "thread")
-    set_tests_properties(tp_tests PROPERTIES
+    set_tests_properties(concurrent_tests PROPERTIES
         ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
 endif()
