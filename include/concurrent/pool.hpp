@@ -725,7 +725,11 @@ namespace concurrent {
                     [[unlikely]] {
                     break;
                 }
-                if (any_work_hint()) {
+                // 睡前最后一搏用 try_acquire 而非只读的 any_work_hint:
+                // 扫的还是同一批队列, 但有活直接拿走执行而非"看到却空手
+                // 回去再来一轮", 全空才睡 - 免竞态协议不变(代际已先读)
+                if (node_t* m = try_acquire(seed)) {
+                    execute_node(m, idx);
                     continue;
                 }
                 wake_gen_.wait(g); // 全空则睡; 推送方 bump 代际唤醒
@@ -763,24 +767,6 @@ namespace concurrent {
                 }
             }
             return nullptr;
-        }
-
-        /// 廉价预检: 任一队列疑似非空则不睡眠(近似值, 宁误醒勿漏活)
-        [[nodiscard]]
-        bool any_work_hint() const noexcept {
-            for (int lv = 0; lv < LEVELS; ++lv) {
-                if ((*globals_)[lv].size_approx()) {
-                    return true;
-                }
-            }
-            for (std::size_t i = 0; i < n_threads_; ++i) {
-                for (int lv = 0; lv < LEVELS; ++lv) {
-                    if (ctxs_[i].local[lv].size_approx()) {
-                        return true;
-                    }
-                }
-            }
-            return false;
         }
 
         static std::uint32_t xorshift(std::uint32_t& s) noexcept {
