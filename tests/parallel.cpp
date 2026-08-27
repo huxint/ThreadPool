@@ -358,6 +358,49 @@ TEST_SUITE("concurrent.parallel") {
         CHECK(v.submitted() == std::size_t{0});               // 无一成功提交
     }
 
+    // 生成器管道: results() 是普通 input_range, 可直接组合 ranges 适配器
+    TEST_CASE("results_composes_with_range_pipelines") {
+        pool p({.threads = 4});
+        std::vector<int> data(100);
+        std::iota(data.begin(), data.end(), 0);
+        auto v = parallel_map(p, data, [](int x) { return x * x; });
+
+        // 平方中的前 3 个奇数值求和: 1+9+25 = 35
+        long sum = 0;
+        for (int y : v.results()
+                      | std::views::transform([](const auto& r) { return *r; })
+                      | std::views::filter([](int y) { return y % 2 == 1; })
+                      | std::views::take(3)) {
+            sum += y;
+        }
+        CHECK(sum == 35L);
+    }
+
+    // results() 与 begin() 共享单趟状态: 先经 begin 预取首元素后,
+    // results() 不得重放(空流), 反之亦然
+    TEST_CASE("results_and_begin_share_single_pass_state") {
+        pool p({.threads = 4});
+        std::vector<int> data{1, 2, 3, 4, 5};
+        auto v = parallel_map(p, data, [](int x) { return x + 10; });
+
+        std::vector<int> got;
+        for (auto&& r : v.results()) {
+            REQUIRE(r.has_value());
+            got.push_back(*r);
+        }
+        CHECK(got == std::vector<int>({11, 12, 13, 14, 15}));
+
+        std::size_t n = 0;
+        for (auto&& r : v.results()) { // 二次进入: 空流
+            static_cast<void>(r);
+            ++n;
+        }
+        CHECK(n == std::size_t{0});
+
+        auto it = v.begin(); // begin 与 results 共享单趟状态
+        CHECK(it == v.end());
+    }
+
     // 生命周期
 
     // 析构必须阻塞至全部已提交任务完成, 闭包持有 f 与元素指针

@@ -7,6 +7,7 @@
 #include <exception>
 #include <expected>
 #include <functional>
+#include <generator>
 #include <memory>
 #include <new>
 #include <optional>

@@ -5,6 +5,7 @@
 #include <exception>
 #include <expected>
 #include <functional>
+#include <generator>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -32,10 +33,12 @@ namespace concurrent {
      * 首次迭代一次性提交全部元素, 随后按**原始顺序**逐个阻塞获取; 即先完成的元素
      * 也要等前序元素被取走, 换来的是结果顺序与输入顺序严格一致
      *
-     * 单趟(input_range)语义: 结果值恰好可取一次
+     * 单趟(input_range)语义: 结果值恰好可取一次. 迭代面经 `std::generator`
+     * 实现, `results()` 亦可独立消费并直接组合 ranges 管道
      *
      * 生命周期: 析构阻塞至全部已提交任务完成 - 任务闭包持有 `f` 与(可能的)
-     * 元素指针, 二者的有效性由本视图存续保证. 底层区间须比本视图更长寿
+     * 元素指针, 二者的有效性由本视图存续保证. 底层区间须比本视图更长寿.
+     * `results()` 产出的生成器捕获本视图地址, 其存续期内本视图不可亡逸
      *
      * 线程安全: `f` 会在多个 worker 上并发调用, 须自行保证可重入
      *
@@ -58,57 +61,9 @@ namespace concurrent {
         using slot_t = std::expected<task<result_type>, submit_error>;
 
     public:
-        struct sentinel {};
-
-        /// 单趟输入迭代器: `++` 阻塞取回下一个结果, `*` 可重复读当前结果
-        class iterator {
-        public:
-            using iterator_category = std::input_iterator_tag;
-            using iterator_concept = std::input_iterator_tag;
-            using value_type = parallel_view::value_type;
-            using difference_type = std::ptrdiff_t;
-            using reference = const value_type&;
-
-            iterator() = default;
-
-            iterator(parallel_view* v, std::size_t i) : view_(v), index_(i) { load(); }
-
-            [[nodiscard]]
-            reference operator*() const noexcept {
-                return *current_;
-            }
-
-            [[nodiscard]]
-            const value_type* operator->() const noexcept {
-                return &*current_;
-            }
-
-            iterator& operator++() {
-                ++index_;
-                load();
-                return *this;
-            }
-
-            void operator++(int) { ++*this; } // 单趟迭代器: 后置递增不返回旧值
-
-            [[nodiscard]]
-            bool operator==(sentinel) const noexcept {
-                return !current_.has_value();
-            }
-
-        private:
-            void load() {
-                if (view_ && index_ < view_->count()) {
-                    current_ = view_->fetch(index_);
-                } else {
-                    current_.reset();
-                }
-            }
-
-            parallel_view* view_ = nullptr;
-            std::size_t index_ = 0;
-            std::optional<value_type> current_{};
-        };
+        /// 迭代面经 std::generator 实现(见 results). generator 的迭代器类型
+        /// 是实现定义细节(无公开嵌套名), 经 decltype 于 begin 取回
+        using iterator = decltype(std::declval<std::generator<value_type>&>().begin());
 
         parallel_view(Pool& p, V range, F fn)
             : pool_(std::addressof(p)), range_(std::move(range)), fn_(std::move(fn)) {}
@@ -132,19 +87,31 @@ namespace concurrent {
             }
         }
 
-        /// 触发整批提交(幂等), 返回首元素迭代器. 单趟语义: 二次调用返回
-        /// 末尾迭代器 - 首轮迭代已按序消费全部结果, 重入不会重放任务
-        [[nodiscard]]
-        iterator begin() {
+        /// 结果流: 触发整批提交(幂等)后按原始顺序逐个阻塞取回. 单趟 -
+        /// 首次调用产出全部结果, 后续调用(含 begin 的二次进入)产出空流,
+        /// 重入不会重放任务. 附带收益: 可直接接 ranges 管道,
+        /// 如 `v.results() | std::views::take(3)`
+        std::generator<value_type> results() {
             launch();
             if (std::exchange(iter_began_, true)) {
-                return iterator{};
+                co_return; // 单趟: 已开始的流不再重放
             }
-            return iterator{this, 0};
+            for (std::size_t i = 0; i < count(); ++i) {
+                co_yield fetch(i);
+            }
+        }
+
+        /// 触发整批提交(幂等), 返回首元素迭代器. begin() 即预取首个
+        /// 结果(generator 首次 begin 恢复协程至首个 co_yield),
+        /// 与旧手写迭代器"构造即 fetch"的语义逐位一致
+        [[nodiscard]]
+        iterator begin() {
+            gen_.emplace(results());
+            return gen_->begin();
         }
 
         [[nodiscard]]
-        sentinel end() const noexcept {
+        std::default_sentinel_t end() const noexcept {
             return {};
         }
 
@@ -261,8 +228,11 @@ namespace concurrent {
         F fn_;
         std::vector<slot_t> slots_;
         std::exception_ptr fatal_; ///< 整批性失败(提交期); 空 = 无
+        /// begin() 委托的生成器. 单趟: begin 重新 emplace, 旧生成器销毁即
+        /// 弃流(已提交任务不受影响, 由 slots_ 与析构等待兜底)
+        std::optional<std::generator<value_type>> gen_{};
         bool launched_ = false;
-        bool iter_began_ = false; ///< 单趟: begin 只发一次首元素迭代器
+        bool iter_began_ = false; ///< 单趟: results/begin 只发一次真流
     };
 
     /**
