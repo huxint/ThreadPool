@@ -183,7 +183,9 @@ namespace concurrent {
          * 返回的 task 携带 request_stop(). 结果值恰好可取一次
          */
         template <typename F, typename... Args>
-            requires(!std::same_as<std::remove_cvref_t<F>, task_priority>)
+            requires(!std::same_as<std::remove_cvref_t<F>, task_priority>) &&
+                    (std::invocable<F, Args...> ||
+                     std::invocable<F, std::stop_token, Args...>) // 不可调用对象在重载处即报, 不再爆在深处
         [[nodiscard]]
         auto submit(F&& f, Args&&... args)
             -> std::expected<task<detail::submit_result_t<F, Args...>>, submit_error> {
@@ -198,7 +200,8 @@ namespace concurrent {
 
         /// 提交带优先级的任务 @requires priority 标签
         template <typename F, typename... Args>
-            requires(PRIORITY)
+            requires(PRIORITY) && (std::invocable<F, Args...> ||
+                                   std::invocable<F, std::stop_token, Args...>)
         [[nodiscard]]
         auto submit(task_priority prio, F&& f, Args&&... args)
             -> std::expected<task<detail::submit_result_t<F, Args...>>, submit_error> {
@@ -314,9 +317,12 @@ namespace concurrent {
         }
 
         /// 可取消的即发即忘执行, 返回取消源 @requires cancellable 标签
+        /// 互斥约束: 无 token 也可调用的 callable 一律归普通重载 - 泛型
+        /// callable(如 [](auto&&...))对两条路皆可行, 不加排斥则二义
         template <typename F, typename... Args>
             requires(CANCELLABLE_TAG && detail::takes_token_v<F, Args...> &&
-                     std::is_nothrow_invocable_v<F, std::stop_token, Args...>)
+                     std::is_nothrow_invocable_v<F, std::stop_token, Args...> &&
+                     !std::is_nothrow_invocable_v<F, Args...>)
         [[nodiscard]]
         std::expected<std::stop_source, submit_error> execute(F&& f, Args&&... args) {
             try {
@@ -330,7 +336,8 @@ namespace concurrent {
         /// 可取消 + 优先级 @requires priority 与 cancellable 标签
         template <typename F, typename... Args>
             requires(PRIORITY && CANCELLABLE_TAG && detail::takes_token_v<F, Args...> &&
-                     std::is_nothrow_invocable_v<F, std::stop_token, Args...>)
+                     std::is_nothrow_invocable_v<F, std::stop_token, Args...> &&
+                     !std::is_nothrow_invocable_v<F, Args...>)
         [[nodiscard]]
         std::expected<std::stop_source, submit_error> execute(task_priority prio, F&& f,
                                                               Args&&... args) {

@@ -493,6 +493,32 @@ TEST_SUITE("concurrent.pool") {
         CHECK(observed_stop.load());
     }
 
+    // 回归: 泛型 callable 对普通/可取消两条 execute 路径皆可行(原先二义).
+    // 消歧规则: 无 token 也可调用的归普通重载; 必须 token 的归可取消重载
+    TEST_CASE("execute_overload_disambiguation_on_generic_callable") {
+        basic_pool<decltype(cancellable)> p({.threads = 1});
+
+        // [](auto&&...) 无 token 也可调用 -> 普通重载, 返回 void 通道
+        auto plain = p.execute([](auto&&...) noexcept {});
+        REQUIRE(plain.has_value());
+
+        // 首参固定 std::stop_token, 无 token 不可调用 -> 可取消重载
+        std::atomic<bool> ran{false};
+        auto src = p.execute([&ran](std::stop_token) noexcept { ran.store(true); });
+        REQUIRE(src.has_value());
+        p.wait();
+        CHECK(ran.load());
+
+        // 编译期侧证(经泛型 lambda 制造依赖上下文): 不可调用对象在
+        // 重载处即被拒, 错误发生在调用点而非 submit_result_t 深处
+        CHECK([]<typename PoolT>(PoolT&) constexpr {
+            return !requires { std::declval<PoolT&>().submit(42); };
+        }(p));
+        CHECK([]<typename PoolT>(PoolT&) constexpr {
+            return !requires { std::declval<PoolT&>().execute(42); };
+        }(p));
+    }
+
     TEST_CASE("uncancelled_token_task_completes_normally") {
         pool p({.threads = 2});
         auto t = p.submit([](std::stop_token tok) { return tok.stop_requested() ? -1 : 123; });
