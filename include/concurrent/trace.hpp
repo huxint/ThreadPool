@@ -25,8 +25,12 @@ namespace concurrent {
         task_phase phase{};
         task_outcome outcome{task_outcome::completed};
         task_priority priority{task_priority::normal}; ///< 未启用 priority 标签时恒为 normal
-        std::size_t worker{};                          ///< worker 索引; enqueue 阶段无意义
+        std::size_t worker{}; ///< worker 索引; 非 worker 线程上触发的事件为 no_worker
     };
+
+    /// trace_event::worker 的哨兵: 事件并非由 worker 触发(enqueue 发生在
+    /// 提交线程上). 具名化以免各处手写 reinterpret 风格的 -1 转换
+    inline constexpr std::size_t no_worker = static_cast<std::size_t>(-1);
 
     /// 调试钩子槽位. 签名中的 noexcept 使"钩子抛异常"直接编译失败,
     /// 与库的零 throw 契约自洽. 用户义务: 线程安全, 执行迅速

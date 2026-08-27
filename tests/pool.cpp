@@ -533,12 +533,13 @@ TEST_SUITE("concurrent.pool") {
             std::uint64_t id;
             task_phase phase;
             task_outcome outcome;
+            std::size_t worker;
         };
         std::mutex m;
         std::vector<record> events;
         auto sink = [&m, &events](trace_event e) noexcept {
             std::scoped_lock lk(m);
-            events.push_back({e.id, e.phase, e.outcome});
+            events.push_back({e.id, e.phase, e.outcome, e.worker});
         };
 
         trace_hooks hooks;
@@ -562,6 +563,13 @@ TEST_SUITE("concurrent.pool") {
             end += e.phase == task_phase::end;
             if (e.phase == task_phase::end) {
                 CHECK(e.outcome == task_outcome::completed);
+            }
+            // 归因: enqueue 发生在提交线程上(哨兵 no_worker), begin/end
+            // 必来自池内 worker
+            if (e.phase == task_phase::enqueue) {
+                CHECK(e.worker == no_worker);
+            } else {
+                CHECK(e.worker < std::size_t{2});
             }
         }
         CHECK(enq == 1);

@@ -145,7 +145,7 @@ namespace concurrent {
          */
         explicit basic_pool(options opts = {}) pre(opts.threads <= 65536)
             pre(WORKER_CAP == 0 || opts.threads <= WORKER_CAP)
-            : hooks_(std::move(opts.hooks)), spin_budget_(opts.spin_budget) {
+            : hooks_(take_hooks(opts)), spin_budget_(opts.spin_budget) {
             n_threads_ = opts.threads
                              ? opts.threads
                              : std::max<std::size_t>(std::jthread::hardware_concurrency(), 1);
@@ -978,7 +978,7 @@ namespace concurrent {
             if constexpr (TRACE) {
                 if (hooks_.on_enqueue) {
                     hooks_.on_enqueue({id, phase_kind::enqueue, outcome_kind::completed,
-                                       effective_priority(p), static_cast<std::size_t>(-1)});
+                                       effective_priority(p), no_worker});
                 }
             }
         }
@@ -1036,10 +1036,23 @@ namespace concurrent {
         /// 全局环体积随容量线性增长(实测 1024 槽 ≈ 64KiB/层, priority 下三层),
         /// 堆分配以保持池对象本身可安全栈上构造; 热路径仅多一次指针解引用
         std::unique_ptr<std::array<gq_t, LEVELS>> globals_;
-        trace_hooks hooks_;
+        /// !TRACE 时零尺寸(monostate + [[no_unique_address]]), 三个
+        /// move_only_function 槽位不再白占池对象
+        [[no_unique_address]] std::conditional_t<TRACE, trace_hooks, std::monostate> hooks_;
         std::size_t n_threads_ = 0;
         /// 睡前忙等预算(options::spin_budget, 构造后只读)
         std::chrono::microseconds spin_budget_{64};
+
+        /// 取走 options 里的钩子; 非 trace 池原样丢弃(存储为零尺寸 monostate)
+        [[nodiscard]]
+        static std::conditional_t<TRACE, trace_hooks, std::monostate> take_hooks(
+            options& opts) noexcept {
+            if constexpr (TRACE) {
+                return std::move(opts.hooks);
+            } else {
+                return std::monostate{};
+            }
+        }
     };
 
     /// 默认别名: 无特性的基础形态

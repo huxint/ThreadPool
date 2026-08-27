@@ -43,6 +43,7 @@ export namespace concurrent {
     using concurrent::worker_cap;
 
     // ---- 调试钩子 ----
+    using concurrent::no_worker;
     using concurrent::task_outcome;
     using concurrent::task_phase;
     using concurrent::trace_event;
