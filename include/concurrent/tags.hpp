@@ -93,13 +93,13 @@ namespace concurrent {
         /// 无标签时折叠为 0, 替换为缺省值
         template <typename... Flags>
         inline constexpr std::size_t queue_global_cap_v = [] {
-            std::size_t v = std::size_t{0};
+            std::size_t v = 0uz;
             ((v = std::max(v, queue_cap_value<Flags>::global)), ...);
             return v != 0 ? v : queue_cap_default_global;
         }();
         template <typename... Flags>
         inline constexpr std::size_t queue_local_cap_v = [] {
-            std::size_t v = std::size_t{0};
+            std::size_t v = 0uz;
             ((v = std::max(v, queue_cap_value<Flags>::local)), ...);
             return v != 0 ? v : queue_cap_default_local;
         }();
@@ -125,6 +125,6 @@ namespace concurrent {
 
         template <typename... Flags>
         inline constexpr std::size_t worker_capacity_v =
-            (std::max({worker_cap_value<Flags>::value..., std::size_t{0}}));
+            (std::max({worker_cap_value<Flags>::value..., 0uz}));
     } // namespace detail
 } // namespace concurrent

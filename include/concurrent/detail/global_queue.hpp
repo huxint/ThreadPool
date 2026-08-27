@@ -4,6 +4,7 @@
 #include <atomic>
 #include <concepts>
 #include <cstddef>
+#include <mutex>
 
 namespace concurrent::detail {
 
@@ -83,7 +84,7 @@ namespace concurrent::detail {
 
     private:
         void push_overflow(Node* n) noexcept {
-            spinlock::guard g{lock_};
+            std::scoped_lock g{lock_};
             n->next_q = nullptr;
             if (tail_) {
                 tail_->next_q = n;
@@ -99,7 +100,7 @@ namespace concurrent::detail {
         /// @return 最老的那个节点; 若竞争中已被别的消费者取空则 nullptr
         [[nodiscard]]
         Node* pop_overflow_and_refill() noexcept {
-            spinlock::guard g{lock_};
+            std::scoped_lock g{lock_};
             Node* first = head_;
             if (!first) { // 竞争者先到, 链已空
                 return nullptr;

@@ -1,4 +1,5 @@
 #pragma once
+#include "concurrent/detail/contract_assert.hpp"
 #include <array>
 #include <atomic>
 #include <bit>
@@ -33,6 +34,9 @@ namespace concurrent::detail {
                 if (dif == 0) {
                     if (tail_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed,
                                                     std::memory_order_relaxed)) {
+                        // 索引协议: seq == pos 即该槽"对本轮位置为空"; CAS 成功后
+                        // 本线程独占该槽, 直至把 seq 发布为 pos+1
+                        CONCURRENT_CONTRACT_ASSERT(seq == static_cast<std::intptr_t>(pos));
                         c.value = value;
                         c.seq.store(static_cast<std::intptr_t>(pos) + 1, std::memory_order_release);
                         return true;
@@ -56,6 +60,9 @@ namespace concurrent::detail {
                 if (dif == 0) {
                     if (head_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed,
                                                     std::memory_order_relaxed)) {
+                        // 索引协议: seq == pos+1 即该槽已写入待弹出; CAS 成功后
+                        // 本线程独占该槽, 直至把 seq 发布为 pos+Capacity(下一轮的空)
+                        CONCURRENT_CONTRACT_ASSERT(seq == static_cast<std::intptr_t>(pos) + 1);
                         T v = c.value;
                         c.seq.store(static_cast<std::intptr_t>(pos) + Capacity,
                                     std::memory_order_release);

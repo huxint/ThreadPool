@@ -6,6 +6,7 @@
 #include <exception>
 #include <expected>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <stop_token>
@@ -177,7 +178,7 @@ namespace concurrent {
             void finish() noexcept {
                 cont_node* list;
                 {
-                    spinlock::guard g{lock_};
+                    std::scoped_lock g{lock_};
                     list = std::exchange(conts_, nullptr);
                     done_.store(1, std::memory_order_release);
                 }
@@ -192,7 +193,7 @@ namespace concurrent {
             /// 附加续延; 若已完成返回 false(调用方需立即内联执行)
             [[nodiscard]]
             bool attach(cont_node* c) noexcept {
-                spinlock::guard g{lock_};
+                std::scoped_lock g{lock_};
                 if (done_.load(std::memory_order_relaxed) == 1) {
                     return false;
                 }
@@ -477,12 +478,11 @@ namespace concurrent {
             std::tuple<slot_store<Ts>...> slots;
 
             void record_error(std::exception_ptr e) noexcept {
-                lk.lock(); // 首错优先
+                std::scoped_lock g{lk}; // 首错优先; RAII 免去手写 unlock
                 if (!errored) {
                     errored = true;
-                    first_err = e;
+                    first_err = std::move(e);
                 }
-                lk.unlock();
             }
 
             template <std::size_t I, typename V>

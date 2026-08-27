@@ -85,9 +85,9 @@ namespace concurrent {
      */
     template <typename... Flags>
     class basic_pool {
-        static_assert((std::size_t{0} + ... + detail::is_worker_cap_flag_v<Flags>) <= 1,
+        static_assert((0uz + ... + detail::is_worker_cap_flag_v<Flags>) <= 1,
                       "worker_cap<N> may appear at most once");
-        static_assert((std::size_t{0} + ... + detail::is_queue_cap_flag_v<Flags>) <= 1,
+        static_assert((0uz + ... + detail::is_queue_cap_flag_v<Flags>) <= 1,
                       "queue_cap<Global, Local> may appear at most once");
 
         static constexpr bool PRIORITY = detail::has_priority_v<Flags...>;
@@ -149,7 +149,7 @@ namespace concurrent {
             : hooks_(take_hooks(opts)), spin_budget_(opts.spin_budget) {
             n_threads_ = opts.threads
                              ? opts.threads
-                             : std::max<std::size_t>(std::jthread::hardware_concurrency(), 1);
+                             : std::max<std::size_t>(std::jthread::hardware_concurrency(), 1uz);
             // 契约在 release 构建下关闭, 而 inplace_vector 溢出会抛 -> 无条件收紧,
             // 保证"零 throw"不依赖构建选项
             if constexpr (WORKER_CAP != 0) {
