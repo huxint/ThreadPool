@@ -24,6 +24,13 @@ namespace concurrent {
         inline constexpr bool carry_by_pointer_v =
             std::is_lvalue_reference_v<std::ranges::range_reference_t<V>>;
 
+        /// 分块粒度解析: grain == 0 时按池线程数取块大小(至少 1)
+        template <typename Pool>
+        [[nodiscard]]
+        std::size_t chunk_grain(const Pool& p, std::size_t grain) noexcept {
+            return grain != 0 ? grain : std::max<std::size_t>(p.thread_count(), 1u);
+        }
+
     } // namespace detail
 
     /**
@@ -269,6 +276,63 @@ namespace concurrent {
         using view_t = std::views::all_t<R&&>;
         return parallel_view<Pool, view_t, F>{p, std::views::all(std::forward<R>(range)),
                                               std::move(fn)};
+    }
+
+    namespace detail {
+
+        /// 分块视图类型: 经 views::all 归一后的底层区间再 chunk
+        template <typename R>
+        using chunked_of = std::ranges::chunk_view<std::views::all_t<R&&>>;
+
+    } // namespace detail
+
+    /**
+     * @brief 惰性分块并行映射: 每 grain 个元素一块提交, `f` 对每块调用一次,
+     *        接收子区间(range), 产出 `std::expected<f 的返回类型, exception_ptr>`
+     *
+     * 元素级开销摊薄到块级 - 大区间应优先分块(每元素一任务的调度开销在细粒度
+     * 元素上是主要成本); 亦缓解整批提交期的内存尖峰: 任务数从元素数降为块数
+     *
+     * 块是引用底层的视图: 底层区间须比本视图更长寿(同 parallel_map)
+     *
+     * @param grain 块大小; 0 = 按 `p.thread_count()` 自动取块
+     *
+     * @warning 惰性: 不迭代(或不调用 run())则一个任务都不会提交
+     */
+    template <typename Pool, std::ranges::forward_range R, typename F>
+        requires std::invocable<F&, std::ranges::range_reference_t<detail::chunked_of<R>>>
+    [[nodiscard]]
+    auto parallel_map_chunked(Pool& p, R&& range, F fn, std::size_t grain = 0) {
+        using chunked_t = detail::chunked_of<R>;
+        return parallel_view<Pool, chunked_t, F>{
+            p,
+            chunked_t{std::views::all(std::forward<R>(range)),
+                      static_cast<std::ranges::range_difference_t<std::views::all_t<R&&>>>(
+                          detail::chunk_grain(p, grain))},
+            std::move(fn)};
+    }
+
+    /**
+     * @brief 惰性分块并行遍历: 每 grain 个元素一块提交, `f` 对每块调用一次,
+     *        接收子区间(range), 产出 `std::expected<void, exception_ptr>` 逐块报错
+     *
+     * @param grain 块大小; 0 = 按 `p.thread_count()` 自动取块
+     *
+     * @warning 惰性: 通常应直接 `.run()`, 否则一个任务都不会提交
+     */
+    template <typename Pool, std::ranges::forward_range R, typename F>
+        requires std::invocable<F&, std::ranges::range_reference_t<detail::chunked_of<R>>> &&
+                 std::is_void_v<
+                     std::invoke_result_t<F&, std::ranges::range_reference_t<detail::chunked_of<R>>>>
+    [[nodiscard]]
+    auto parallel_for_chunked(Pool& p, R&& range, F fn, std::size_t grain = 0) {
+        using chunked_t = detail::chunked_of<R>;
+        return parallel_view<Pool, chunked_t, F>{
+            p,
+            chunked_t{std::views::all(std::forward<R>(range)),
+                      static_cast<std::ranges::range_difference_t<std::views::all_t<R&&>>>(
+                          detail::chunk_grain(p, grain))},
+            std::move(fn)};
     }
 
 } // namespace concurrent

@@ -470,4 +470,176 @@ TEST_SUITE("concurrent.parallel") {
         }
         CHECK(tu::tracked::live.load() == base);
     }
+
+    // ---- 分块入口 ----
+
+    // 基本正确性: 每块求和, 块结果按序拼接
+    TEST_CASE("chunked_map_sums_blocks") {
+        pool p({.threads = 4});
+        std::vector<int> data(100);
+        std::iota(data.begin(), data.end(), 1); // 1..100
+
+        auto v = parallel_map_chunked(
+            p, data, [](auto&& c) { return std::accumulate(c.begin(), c.end(), 0L); }, 7);
+
+        long total = 0;
+        std::size_t blocks = 0;
+        for (auto&& r : v) {
+            REQUIRE(r.has_value());
+            total += *r;
+            ++blocks;
+        }
+        CHECK(total == 5050L); // 1..100 之和
+        CHECK(blocks == std::size_t{15}); // ceil(100/7)
+    }
+
+    // grain == 0: 块大小取池线程数
+    TEST_CASE("chunked_grain_zero_auto_sizes") {
+        pool p({.threads = 4});
+        std::vector<int> data(100, 1);
+        auto v = parallel_map_chunked(
+            p, data, [](auto&& c) { return static_cast<long>(std::ranges::size(c)); });
+
+        std::size_t blocks = 0;
+        long grain_seen = 0;
+        for (auto&& r : v) {
+            REQUIRE(r.has_value());
+            grain_seen += *r; // 每块元素数
+            ++blocks;
+        }
+        CHECK(blocks == std::size_t{25}); // 100 / 4
+        CHECK(grain_seen == 100L);
+        CHECK(v.submitted() == std::size_t{25});
+    }
+
+    // 块内顺序与输入一致(块间并发完成, 顺序无保证; 块内元素连续)
+    TEST_CASE("chunked_preserves_intra_block_order") {
+        pool p({.threads = 4});
+        std::vector<int> data(60);
+        std::iota(data.begin(), data.end(), 0);
+
+        std::atomic<int> bad_blocks{0};
+        auto v = parallel_for_chunked(
+            p, data,
+            [&](auto&& c) {
+                int prev = *c.begin() - 1;
+                for (auto&& e : c) {
+                    if (e != prev + 1) { // 块内必须连续递增
+                        bad_blocks.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    prev = e;
+                }
+            },
+            10);
+
+        CHECK(v.run().has_value());
+        CHECK(bad_blocks.load() == 0);
+    }
+
+    // 错误隔离: 单块抛出只污染该块的结果
+    TEST_CASE("chunked_error_isolation") {
+        pool p({.threads = 4});
+        std::vector<int> data(20);
+        std::iota(data.begin(), data.end(), 0);
+
+        auto v = parallel_map_chunked(
+            p, data,
+            [](auto&& c) -> long {
+                auto first = *c.begin();
+                if (first == 0) { // 含 0 的块(第一块)抛出
+                    throw std::runtime_error("boom");
+                }
+                return std::accumulate(c.begin(), c.end(), 0L);
+            },
+            5);
+
+        std::size_t failed = 0, ok = 0;
+        long ok_sum = 0;
+        for (auto&& r : v) {
+            if (r) {
+                ++ok;
+                ok_sum += *r;
+            } else {
+                ++failed;
+            }
+        }
+        CHECK(failed == std::size_t{1}); // 仅第一块
+        CHECK(ok == std::size_t{3});
+        CHECK(ok_sum == 180L); // 5..19 之和
+    }
+
+    // 与逐元素入口结果一致: 分块求和 == 逐元素映射后求和
+    TEST_CASE("chunked_matches_elementwise") {
+        pool p({.threads = 4});
+        std::vector<int> data(97);
+        std::iota(data.begin(), data.end(), 0);
+
+        auto chunked = parallel_map_chunked(
+            p, data, [](auto&& c) { return std::accumulate(c.begin(), c.end(), 0L); }, 11);
+        long sum_chunked = 0;
+        for (auto&& r : chunked) {
+            sum_chunked += r.value_or(0);
+        }
+
+        auto elementwise = parallel_map(p, data, [](int x) { return static_cast<long>(x); });
+        long sum_elem = 0;
+        for (auto&& r : elementwise) {
+            sum_elem += r.value_or(0);
+        }
+
+        CHECK(sum_chunked == sum_elem);
+        CHECK(sum_chunked == 97L * 96L / 2L);
+    }
+
+    // grain 覆盖整个区间 => 单块
+    TEST_CASE("chunked_grain_exceeds_range_is_single_block") {
+        pool p({.threads = 4});
+        std::vector<int> data(10, 2);
+        auto v = parallel_map_chunked(
+            p, data, [](auto&& c) { return static_cast<long>(std::ranges::size(c)); }, 100);
+
+        long got = 0;
+        std::size_t blocks = 0;
+        for (auto&& r : v) {
+            REQUIRE(r.has_value());
+            got = *r;
+            ++blocks;
+        }
+        CHECK(blocks == std::size_t{1});
+        CHECK(got == 10L);
+        CHECK(v.submitted() == std::size_t{1});
+    }
+
+    // 生成式区间(右值 view): iota 按块取回
+    TEST_CASE("chunked_accepts_generated_range") {
+        pool p({.threads = 4});
+        auto v = parallel_map_chunked(
+            p, std::views::iota(0, 50),
+            [](auto&& c) { return std::accumulate(c.begin(), c.end(), 0L); }, 10);
+
+        long total = 0;
+        for (auto&& r : v) {
+            REQUIRE(r.has_value());
+            total += *r;
+        }
+        CHECK(total == 1225L); // 0..49 之和
+    }
+
+    // 惰性语义与分块入口同样成立
+    TEST_CASE("chunked_is_lazy_until_iteration") {
+        pool p({.threads = 4});
+        std::atomic<int> calls{0};
+        std::vector<int> data(50, 1);
+
+        {
+            auto v = parallel_for_chunked(
+                p, data, [&calls](auto&&) { calls.fetch_add(1, std::memory_order_relaxed); }, 5);
+            CHECK(v.submitted() == std::size_t{0});
+            std::this_thread::sleep_for(20ms);
+            CHECK(calls.load() == 0);
+        }
+        p.wait();
+        CHECK(calls.load() == 0);
+    }
 }
