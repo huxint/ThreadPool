@@ -4,12 +4,17 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 using namespace concurrent;
 using namespace std::chrono_literals;
@@ -694,5 +699,54 @@ TEST_SUITE("concurrent.pool") {
             sorted &= (order[static_cast<std::size_t>(i)] == i);
         }
         CHECK(sorted);
+    }
+
+    // 回归: 空闲节点缓存必须设上限. 无上限时外部线程持续提交会让每 worker 的
+    // 缓存随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不取).
+    // Linux-only 粗粒度冒烟: 百万次外部 execute 后 RSS 增量须低于宽松上界
+    TEST_CASE("node_cache_bounded_rss_under_external_execute") {
+#if defined(__linux__)
+        auto rss_pages = [] {
+            std::FILE* f = std::fopen("/proc/self/statm", "re");
+            if (!f) {
+                return -1L;
+            }
+            long size = 0, resident = 0;
+            const int got = std::fscanf(f, "%ld %ld", &size, &resident);
+            std::fclose(f);
+            return got == 2 ? resident : -1L;
+        };
+        const long page = sysconf(_SC_PAGESIZE);
+        REQUIRE(page > 0);
+
+        std::atomic<int> hits{0};
+        {
+            pool p({.threads = 4});
+            const long before = rss_pages();
+            REQUIRE(before > 0);
+
+            constexpr int n = 1000000;
+            int accepted = 0;
+            for (int i = 0; i < n; ++i) {
+                if (p.execute(
+                        [&hits]() noexcept { hits.fetch_add(1, std::memory_order_relaxed); })) {
+                    ++accepted;
+                }
+            }
+            p.wait();
+            REQUIRE(accepted == n);
+            REQUIRE(hits.load() == n);
+
+            const long after = rss_pages();
+            REQUIRE(after > 0);
+            const long delta_mb = (after - before) * page / (1024 * 1024);
+            // 未修复版本实测: 4 worker x 百万任务滞留约 120+ MiB(112B 节点
+            // 入 malloc 128 桶); 上界 64 MiB 距满额缓存(4 x 128 KiB)与
+            // 分配器噪声均有充分裕量
+            CHECK(delta_mb < 64);
+        }
+#else
+        (void)0; // 非 Linux: 静默跳过
+#endif
     }
 }

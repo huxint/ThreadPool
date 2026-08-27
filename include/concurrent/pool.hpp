@@ -2,6 +2,7 @@
 #include "concurrent/detail/chase_lev.hpp"
 #include "concurrent/detail/cpu_relax.hpp"
 #include "concurrent/detail/global_queue.hpp"
+#include "concurrent/detail/node_cache.hpp"
 #include "concurrent/tags.hpp"
 #include "concurrent/task.hpp"
 #include "concurrent/trace.hpp"
@@ -32,10 +33,10 @@ namespace concurrent {
 
     namespace detail {
 
-        /// worker 线程上下文: 身份 + 空闲节点回收链 + 分层本地 deque
-        template <std::size_t Levels, std::size_t LocalCap>
+        /// worker 线程上下文: 身份 + 空闲节点缓存 + 分层本地 deque
+        template <std::size_t Levels, std::size_t LocalCap, std::size_t CacheCap>
         struct alignas(64) worker_ctx {
-            std::atomic<task_node*> free_head{nullptr}; ///< MPSC 入 / 单消费者出
+            node_cache<task_node, CacheCap> cache; ///< MPSC 入 / 单消费者出, 带上限
             std::size_t index = 0;
             std::array<chase_lev_deque<task_node*, LocalCap>, Levels> local{};
         };
@@ -44,26 +45,6 @@ namespace concurrent {
         /// 初始化, 免去 TLS 动态初始化守卫检查
         inline constinit thread_local const void* tls_pool = nullptr;
         inline constinit thread_local std::size_t tls_worker = 0;
-
-        /// MPSC Treiber 压栈(任意线程)/ 单消费者弹出(仅所有者)
-        /// 仅单一消费者 -> 无 ABA
-        inline void freelist_push(std::atomic<task_node*>& head, task_node* n) noexcept {
-            task_node* h = head.load(std::memory_order_relaxed);
-            do {
-                n->next_free = h;
-            } while (!head.compare_exchange_weak(h, n, std::memory_order_release,
-                                                 std::memory_order_relaxed));
-        }
-        inline task_node* freelist_pop(std::atomic<task_node*>& head) noexcept {
-            auto h = head.load(std::memory_order_acquire);
-            while (h) {
-                if (head.compare_exchange_weak(h, h->next_free, std::memory_order_acquire,
-                                               std::memory_order_acquire)) {
-                    return h;
-                }
-            }
-            return nullptr;
-        }
 
         /// submit 的结果类型: token 感知调用优先匹配
         template <typename F, typename... Args>
@@ -114,6 +95,9 @@ namespace concurrent {
         static constexpr std::size_t LOCAL_CAP = 256; ///< 本地 deque 容量(2 的幂)
         static constexpr std::size_t GLOBAL_CAP =
             16384; ///< 全局无锁环容量/层(超出部分落入保序溢出链)
+        /// 每 worker 空闲节点缓存上限. 无上限时外部线程持续提交会让缓存长度
+        /// 随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不来取)
+        static constexpr std::size_t NODE_CACHE_CAP = 1024;
         /// 睡眠前的忙等时间预算: 任务常成簇到达(嵌套提交, 往返模式),
         /// 一小段自旋即可吸收"生产者已在路上"的窗口, 免去每次 futex 睡/醒
         /// 的内核往返 - 实测将空池往返 P50 从 ~55µs 降至亚微秒级
@@ -123,7 +107,7 @@ namespace concurrent {
 
         using node_t = detail::task_node;
         using gq_t = detail::global_queue<node_t, GLOBAL_CAP>;
-        using worker_ctx_t = detail::worker_ctx<LEVELS, LOCAL_CAP>;
+        using worker_ctx_t = detail::worker_ctx<LEVELS, LOCAL_CAP, NODE_CACHE_CAP>;
         using outcome_kind = task_outcome;
         using phase_kind = task_phase;
 
@@ -641,7 +625,10 @@ namespace concurrent {
             // 带进队列, 关闭丢弃时 abandon 便在已释放的状态上写入
             n->discard = nullptr;
             n->discard_ctx = nullptr;
-            detail::freelist_push(ctxs_[worker].free_head, n);
+            // 缓存已满则直接归还分配器: 节点此刻已是干净空壳
+            if (!ctxs_[worker].cache.push(n)) {
+                delete n;
+            }
         }
 
         void notify_wake() noexcept {
@@ -656,8 +643,7 @@ namespace concurrent {
 
         node_t* acquire_node() noexcept {
             if (detail::tls_pool == static_cast<const void*>(this)) {
-                if (auto* n = detail::freelist_pop(ctxs_[detail::tls_worker].free_head)) [[likely]]
-                {
+                if (auto* n = ctxs_[detail::tls_worker].cache.pop()) [[likely]] {
                     return n;
                 }
             }
@@ -852,7 +838,7 @@ namespace concurrent {
 
         void flush_freelists() noexcept {
             for (std::size_t i = 0; i < n_threads_; ++i) {
-                while (auto* n = detail::freelist_pop(ctxs_[i].free_head)) {
+                while (auto* n = ctxs_[i].cache.pop()) {
                     destroy_node(n);
                 }
             }
