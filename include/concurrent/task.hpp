@@ -589,40 +589,48 @@ namespace concurrent {
 
         /// 变换成功值: f 接收 T&&(void 任务无参), 在完成任务的工作线程上内联执行
         template <typename F>
-        auto map(F&& f) -> task<typename detail::map_result_of<T, F>::type> {
+        auto map(this auto&& self, F&& f) -> task<typename detail::map_result_of<T, F>::type> {
             using U = typename detail::map_result_of<T, F>::type;
-            if (!st_) [[unlikely]] {
+            if (!self.st_) [[unlikely]] {
                 return task<U>{}; // 无效任务的组合仍是无效任务
             }
-            try {
-                auto child = detail::make_state<U>();
-                using node_t = detail::map_cont<state_t, std::decay_t<F>, U>;
-                auto* n = new (std::nothrow) node_t{{}, child, std::forward<F>(f)};
-                if (!n) {
-                    return detail::failed_task<U>();
-                }
-                if (!st_->attach(n)) {
-                    n->run(*st_); // 父任务已完成: 立即内联
-                    delete n;
-                }
-                return task<U>{std::move(child)};
-            } catch (...) {
-                return detail::failed_task<U>(); // make_state 的 bad_alloc
-            }
+            return self
+                .template attach_cont<U, detail::map_cont<state_t, std::decay_t<F>, U>>(
+                    std::forward<F>(f));
         }
 
         /// 绑定: f 接收 T&& 返回后续 task, 其结果透传为本次结果
         template <typename F>
-        auto and_then(F&& f) -> task<typename detail::and_then_inner_of<T, F>::type::value_type> {
+        auto and_then(this auto&& self, F&& f)
+            -> task<typename detail::and_then_inner_of<T, F>::type::value_type> {
             using Inner = typename detail::and_then_inner_of<T, F>::type;
             using U = typename Inner::value_type;
-            if (!st_) [[unlikely]] {
+            if (!self.st_) [[unlikely]] {
                 return task<U>{}; // 无效任务的组合仍是无效任务
             }
+            return self
+                .template attach_cont<U, detail::and_then_cont<state_t, std::decay_t<F>, Inner>>(
+                    std::forward<F>(f));
+        }
+
+        /// 旁观副作用: f 接收 T&(void 任务无参), 不改变结果与错误通道
+        template <typename F>
+        auto inspect(this auto&& self, F&& f) -> task<T> {
+            if (!self.st_) [[unlikely]] {
+                return task{}; // 无效任务的组合仍是无效任务
+            }
+            return self.template attach_cont<T, detail::inspect_cont<state_t, std::decay_t<F>>>(
+                std::forward<F>(f));
+        }
+
+    private:
+        /// 组合子共用骨架: 建子状态 -> 续延节点 nothrow 分配 -> 挂接
+        /// (父任务已完成则立即内联执行) -> 返回子任务
+        template <typename U, typename NodeT, typename... A>
+        task<U> attach_cont(A&&... a) {
             try {
                 auto child = detail::make_state<U>();
-                using node_t = detail::and_then_cont<state_t, std::decay_t<F>, Inner>;
-                auto* n = new (std::nothrow) node_t{{}, child, std::forward<F>(f)};
+                auto* n = new (std::nothrow) NodeT{{}, child, std::forward<A>(a)...};
                 if (!n) {
                     return detail::failed_task<U>();
                 }
@@ -636,29 +644,7 @@ namespace concurrent {
             }
         }
 
-        /// 旁观副作用: f 接收 T&(void 任务无参), 不改变结果与错误通道
-        template <typename F>
-        task inspect(F&& f) {
-            if (!st_) [[unlikely]] {
-                return task{}; // 无效任务的组合仍是无效任务
-            }
-            try {
-                auto child = detail::make_state<T>();
-                using node_t = detail::inspect_cont<state_t, std::decay_t<F>>;
-                auto* n = new (std::nothrow) node_t{{}, child, std::forward<F>(f)};
-                if (!n) {
-                    return detail::failed_task<T>();
-                }
-                if (!st_->attach(n)) {
-                    n->run(*st_); // 父任务已完成: 立即内联
-                    delete n;
-                }
-                return task<T>{std::move(child)};
-            } catch (...) {
-                return detail::failed_task<T>(); // make_state 的 bad_alloc
-            }
-        }
-
+    public:
         std::shared_ptr<detail::shared_state<T>> st_;
     };
 
