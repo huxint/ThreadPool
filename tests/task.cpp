@@ -257,7 +257,19 @@ TEST_SUITE("concurrent.task") {
     TEST_CASE("invalid_task_get_wait_and_request_stop_are_safe") {
         task<int> t;
         CHECK(!t.valid());
-        CHECK(!t.get().has_value());
+        auto r = t.get();
+        REQUIRE(!r.has_value());
+        // 具名标记: 可判别, rethrow 不再是空指针 UB
+        CHECK(is_invalid_task(r.error()));
+        bool caught = false;
+        try {
+            std::rethrow_exception(r.error());
+        } catch (const invalid_task&) {
+            caught = true;
+        }
+        CHECK(caught);
+        CHECK(!is_cancelled(r.error()));
+        CHECK(!submit_error_of(r.error()).has_value());
         t.wait();         // 不得崩溃
         t.request_stop(); // 不得崩溃
     }

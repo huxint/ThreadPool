@@ -18,8 +18,10 @@ export namespace concurrent {
     using concurrent::shutdown_policy;
 
     // ---- 任务与错误通道 ----
+    using concurrent::invalid_task;
     using concurrent::invalid_task_error;
     using concurrent::is_cancelled;
+    using concurrent::is_invalid_task;
     using concurrent::operation_cancelled;
     using concurrent::submit_error;
     using concurrent::submit_error_of;

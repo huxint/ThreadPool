@@ -25,8 +25,32 @@ namespace concurrent {
     /// 被取消任务的错误标记(经 get() 的错误通道返回)
     struct operation_cancelled {};
 
-    /// 无效任务(默认构造后 get)的空错误指针; 请以 valid() 预检
-    inline const std::exception_ptr invalid_task_error{};
+    /// 无效任务的错误标记: 默认构造的句柄经 get(), 或结果已被消费后的
+    /// 再次 get(). 此前用空 exception_ptr 承载 - 用户最自然的
+    /// rethrow_exception 在该路径是 UB, is_cancelled / submit_error_of
+    /// 也一概返回"没事"; 具名化后可安全重抛与判别
+    struct invalid_task {};
+
+    /// 错误通道中 invalid_task 的错误指针
+    [[nodiscard]]
+    inline std::exception_ptr invalid_task_error() noexcept {
+        return std::make_exception_ptr(invalid_task{});
+    }
+
+    /// 该错误是否表示任务句柄无效(默认构造 / 结果已被消费)
+    [[nodiscard]]
+    inline bool is_invalid_task(const std::exception_ptr& e) noexcept {
+        if (!e) {
+            return false;
+        }
+        try {
+            std::rethrow_exception(e);
+        } catch (const invalid_task&) {
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
 
     /// 从错误通道辨识"提交阶段失败". 零 throw 契约允许库内 catch - 异常不外泄
     /// @return 若该错误由 submit_error 承载则返回之, 否则 nullopt
@@ -240,7 +264,7 @@ namespace concurrent {
                 }
             }
 
-            /// 取走结果. 空错误指针表示无效任务或结果已被消费
+            /// 取走结果. invalid_task 标记表示结果已被消费
             [[nodiscard]]
             std::expected<T, std::exception_ptr> take_result() {
                 wait_done();
@@ -249,7 +273,7 @@ namespace concurrent {
                 }
                 if constexpr (!std::is_void_v<T>) {
                     if (!has_value_) {
-                        return std::unexpected(invalid_task_error);
+                        return std::unexpected(invalid_task_error());
                     }
                     return take_value_unchecked();
                 } else {
@@ -369,7 +393,7 @@ namespace concurrent {
                     return;
                 }
                 if (!inner_st) {
-                    dst->set_exception(invalid_task_error);
+                    dst->set_exception(invalid_task_error());
                     dst->finish();
                     return;
                 }
@@ -565,7 +589,7 @@ namespace concurrent {
         [[nodiscard]]
         std::expected<T, std::exception_ptr> get() {
             if (!st_) {
-                return std::unexpected(invalid_task_error);
+                return std::unexpected(invalid_task_error());
             }
             return st_->take_result();
         }
@@ -688,8 +712,8 @@ namespace concurrent {
                 [[maybe_unused]]
                 auto attach_one = [&]<std::size_t I, typename TIn>(
                                       std::integral_constant<std::size_t, I>, task<TIn>& t) {
-                    if (!t.st_) [[unlikely]] { // 无效入参: 以空错误指针沉淀, 不解引用
-                        core->record_error(invalid_task_error);
+                    if (!t.st_) [[unlikely]] { // 无效入参: 以具名标记沉淀, 不解引用
+                        core->record_error(invalid_task_error());
                         core->settle_one();
                         return;
                     }
