@@ -20,6 +20,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace concurrent {
@@ -412,6 +413,24 @@ namespace concurrent {
         }
 
     private:
+        /// trace 专用捕获(任务编号 + 优先级). 标签关闭时折叠为 monostate,
+        /// 任务闭包除 self/实参之外零固定开销, SBO 预算全部留给用户捕获
+        struct trace_env {
+            std::uint64_t id = 0;
+            task_priority prio = task_priority::normal;
+        };
+        using trace_env_t = std::conditional_t<TRACE, trace_env, std::monostate>;
+
+        [[nodiscard]]
+        trace_env_t make_trace_env([[maybe_unused]] std::uint64_t id,
+                                   [[maybe_unused]] task_priority prio) noexcept {
+            if constexpr (TRACE) {
+                return trace_env{.id = id, .prio = prio};
+            } else {
+                return {};
+            }
+        }
+
         /// 构建 submit 型节点(状态 + 闭包 + 丢弃终结钩子), 未入队
         /// @return 空 = 仅因 bad_alloc; 其余异常(F/实参拷贝)原样传播
         template <typename R, typename F, typename... Args>
@@ -433,9 +452,10 @@ namespace concurrent {
             }
 
             auto* self = this;
-            node->body = [st, self, prio, f = std::forward<F>(f),
+            const trace_env_t env = make_trace_env(st->id, prio);
+            node->body = [st, self, env, f = std::forward<F>(f),
                           ... a = std::forward<Args>(args)]() mutable noexcept {
-                self->run_task_body(*st, prio, [&]() -> R {
+                self->run_task_body(*st, env, [&]() -> R {
                     if constexpr (detail::takes_token_v<F, Args...>) {
                         return std::invoke(std::move(f), st->source.get_token(), std::move(a)...);
                     } else {
@@ -484,11 +504,16 @@ namespace concurrent {
             if constexpr (TRACE) {
                 id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
             }
-            node->body = [self, id, prio, f = std::forward<F>(f),
+            const trace_env_t env = make_trace_env(id, prio);
+            node->body = [self, env, f = std::forward<F>(f),
                           ... a = std::forward<Args>(args)]() mutable noexcept {
-                self->trace_begin(id, prio);
+                if constexpr (TRACE) {
+                    self->trace_begin(env.id, env.prio);
+                }
                 std::invoke(std::move(f), std::move(a)...); // noexcept 由 concepts 强制
-                self->trace_end(id, prio, outcome_kind::completed);
+                if constexpr (TRACE) {
+                    self->trace_end(env.id, env.prio, outcome_kind::completed);
+                }
                 self->complete_one();
             };
 
@@ -515,14 +540,21 @@ namespace concurrent {
             if constexpr (TRACE) {
                 id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
             }
-            node->body = [self, id, prio, source, f = std::forward<F>(f),
+            const trace_env_t env = make_trace_env(id, prio);
+            node->body = [self, env, source, f = std::forward<F>(f),
                           ... a = std::forward<Args>(args)]() mutable noexcept {
-                self->trace_begin(id, prio);
+                if constexpr (TRACE) {
+                    self->trace_begin(env.id, env.prio);
+                }
                 if (!source->stop_requested()) {
                     std::invoke(std::move(f), source->get_token(), std::move(a)...);
-                    self->trace_end(id, prio, outcome_kind::completed);
+                    if constexpr (TRACE) {
+                        self->trace_end(env.id, env.prio, outcome_kind::completed);
+                    }
                 } else {
-                    self->trace_end(id, prio, outcome_kind::cancelled);
+                    if constexpr (TRACE) {
+                        self->trace_end(env.id, env.prio, outcome_kind::cancelled);
+                    }
                 }
                 self->complete_one();
             };
@@ -538,10 +570,12 @@ namespace concurrent {
 
         /// 有状态任务的外壳: 取消检查 -> 异常捕获 -> 结果发布 -> 续延内联 -> 计数收尾
         template <typename State, typename Invoker>
-        void run_task_body(State& st, task_priority prio, Invoker&& invoke) noexcept {
+        void run_task_body(State& st, const trace_env_t& env, Invoker&& invoke) noexcept {
             outcome_kind o = outcome_kind::completed;
 
-            trace_begin(st.id, prio);
+            if constexpr (TRACE) {
+                trace_begin(env.id, env.prio);
+            }
             if (st.source.stop_requested()) {
                 st.set_cancelled();
                 o = outcome_kind::cancelled;
@@ -557,7 +591,9 @@ namespace concurrent {
                     o = outcome_kind::failed;
                 }
             }
-            trace_end(st.id, prio, o);
+            if constexpr (TRACE) {
+                trace_end(env.id, env.prio, o);
+            }
             st.finish(); // 先发布完成再跑续延(续延可能回查本状态)
             complete_one();
         }
