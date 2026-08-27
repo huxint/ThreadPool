@@ -14,6 +14,7 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace concurrent {
 
@@ -130,6 +131,74 @@ namespace concurrent {
             }
         };
 
+        /// 前置声明: 深度守卫基础设施的签名需要(定义在下方)
+        template <typename T>
+        class shared_state;
+
+        /// 续延链深度守卫: finish -> invoke -> run -> dst->finish() 是递归,
+        /// 栈深与 map/inspect 链长线性相关, 长链爆栈. 深度超限时把子状态的
+        /// finish 登记到待重放队列, 由最外层 finish 的收尾在同线程排空
+        /// (trampoline): 每次重放从浅深度重新进入, 栈深有界; 队列元素持
+        /// shared_ptr 保活, 节点销毁不悬挂
+        inline constexpr int cont_depth_limit = 64;
+
+        inline thread_local int cont_depth = 0;
+
+        /// 待重放的 finish 请求: 状态引用 + 类型擦除的 finish 入口
+        struct pending_finish {
+            std::shared_ptr<void> state;
+            void (*finish)(const std::shared_ptr<void>&) noexcept;
+        };
+
+        /// 待重放队列(函数内 TLS: 命名模块下 namespace 级 inline thread_local
+        /// 非平凡变量会在模块单元与导入方各生成一份 TLS init wrapper, 链接冲突;
+        /// 函数内 TLS 符号内部链接, 且仅首次超限时构造. cont_depth / in_drain
+        /// 平凡可零初始化, 无 wrapper, 不受此限)
+        inline std::vector<pending_finish>& pending_finishes() noexcept {
+            thread_local std::vector<pending_finish> q;
+            return q;
+        }
+
+        /// drain 进行中标志: 重入的排空请求直接返回(见 drain_pending_finishes)
+        inline thread_local bool in_drain = false;
+
+        /// 排空待重放队列. 仅最外层 finish 收尾调用; 重入时直接返回 -
+        /// 内层 finish 的收尾看见队列非空也无需自己动手, 本循环会继续消费,
+        /// 嵌套 drain 会把栈深重新与链长挂钩
+        inline void drain_pending_finishes() noexcept {
+            if (in_drain) {
+                return;
+            }
+            in_drain = true;
+            auto& q = pending_finishes();
+            while (!q.empty()) {
+                pending_finish e = std::move(q.back());
+                q.pop_back();
+                e.finish(e.state); // 重放的 finish 可能再登记, 循环继续消费
+            }
+            in_drain = false;
+        }
+
+        /// finish 的深度守卫入口(续延末尾调用): 浅深度内联继续, 超限登记待重放.
+        /// 登记需分配, 失败(bad_alloc)时退回内联 - 本路径及上游全链 noexcept,
+        /// 逃逸的异常只会 terminate 并丢失结果值; OOM 下栈深风险是较小恶
+        template <typename T>
+        void finish_or_defer(std::shared_ptr<shared_state<T>> st) noexcept {
+            if (cont_depth >= cont_depth_limit) [[unlikely]] {
+                try {
+                    pending_finishes().push_back(pending_finish{
+                        st, // 拷贝而非移动: 分配失败时 st 仍持有引用, 可退回内联
+                        [](const std::shared_ptr<void>& p) noexcept {
+                            static_cast<shared_state<T>*>(p.get())->finish();
+                        }});
+                    return;
+                } catch (...) {
+                    // 登记失败: 落入下方内联路径
+                }
+            }
+            st->finish();
+        }
+
         /// 值存储: 非 void 用对齐裸存储; void 用零体积 monostate 占位
         /// 特化而非 std::conditional_t, 避免 sizeof(void)/alignof(void) 在非选中分支被实例化
         /// (不用 std::aligned_storage_t - C++23 起已弃用)
@@ -183,10 +252,17 @@ namespace concurrent {
                     done_.store(1, std::memory_order_release);
                 }
                 done_.notify_all();
+                ++cont_depth; // 本帧的续延以内联深度计(见 cont_depth_limit)
                 while (list) {
                     cont_node* n = std::exchange(list, list->next);
                     n->invoke(n, reinterpret_cast<void*>(this));
                     n->destroy(n); // 续延节点一次性消耗
+                }
+                --cont_depth;
+                if (cont_depth == 0) {
+                    // 最外层帧: 排空深层链登记的待重放 finish, 每次重放
+                    // 从浅深度进入, 栈深不随链长增长
+                    drain_pending_finishes();
                 }
             }
 
@@ -325,7 +401,7 @@ namespace concurrent {
                         dst->set_exception(std::current_exception());
                     }
                 }
-                dst->finish();
+                finish_or_defer(std::move(dst));
             }
         };
 
@@ -352,7 +428,7 @@ namespace concurrent {
                         dst->set_exception(std::current_exception());
                     }
                 }
-                dst->finish();
+                finish_or_defer(std::move(dst));
             }
         };
 
@@ -371,12 +447,12 @@ namespace concurrent {
                 using V = typename ParentState::value_type;
                 if (parent.cancelled()) {
                     dst->set_cancelled();
-                    dst->finish();
+                    finish_or_defer(std::move(dst));
                     return;
                 }
                 if (auto e = parent.raw_exception()) {
                     dst->set_exception(e);
-                    dst->finish();
+                    finish_or_defer(std::move(dst));
                     return;
                 }
                 std::shared_ptr<inner_state_t> inner_st;
@@ -390,12 +466,12 @@ namespace concurrent {
                     }
                 } catch (...) {
                     dst->set_exception(std::current_exception());
-                    dst->finish();
+                    finish_or_defer(std::move(dst));
                     return;
                 }
                 if (!inner_st) {
                     dst->set_exception(invalid_task_error());
-                    dst->finish();
+                    finish_or_defer(std::move(dst));
                     return;
                 }
                 // 本状态的完成绑定到内层任务完成
@@ -409,13 +485,13 @@ namespace concurrent {
                         } else if constexpr (!std::is_void_v<U>) {
                             dst->emplace_value(src.take_value_unchecked());
                         }
-                        dst->finish();
+                        finish_or_defer(std::move(dst));
                     }
                 };
                 auto* n = new (std::nothrow) fwd{{}, dst};
                 if (!n) {
                     dst->set_exception(std::make_exception_ptr(std::bad_alloc{}));
-                    dst->finish();
+                    finish_or_defer(std::move(dst));
                     return;
                 }
                 if (!inner_st->attach(n)) {
@@ -502,7 +578,8 @@ namespace concurrent {
                             dst->set_exception(std::current_exception());
                         }
                     }
-                    dst->finish();
+                    // dst 由本分支独占(remaining 归零仅一次): 移交守卫入口
+                    finish_or_defer(std::move(dst));
                 }
             }
 

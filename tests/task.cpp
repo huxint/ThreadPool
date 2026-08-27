@@ -97,6 +97,24 @@ TEST_SUITE("concurrent.task") {
         CHECK(is_cancelled(r.error())); // 取消语义沿链路传播
     }
 
+    // 深链守卫: finish -> run -> finish 的嵌套深度曾与链长线性, 长链爆栈.
+    // 闸门保证根任务在全部 map 附着完成后才触发, 整条链从一个 finish
+    // 事件连锁展开(而非逐步独立内联), 深度守卫的登记/重放路径必经
+    TEST_CASE("deep_map_chain_does_not_overflow_stack") {
+        pool p({.threads = 2});
+        tu::gate g;
+        g.block_all(p, 2);
+
+        auto t = p.submit([] { return 0; });
+        REQUIRE(t.has_value());
+        constexpr int n = 100000;
+        for (int i = 0; i < n; ++i) {
+            t = t->map([](int v) { return v + 1; });
+        }
+        g.release();
+        CHECK(t->get().value_or(-1) == n);
+    }
+
     // and_then
 
     TEST_CASE("and_then_binds_next_task") {
