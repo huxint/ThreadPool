@@ -494,11 +494,7 @@ namespace concurrent {
                 self->trace_begin(id, prio);
                 std::invoke(std::move(f), std::move(a)...); // noexcept 由 concepts 强制
                 self->trace_end(id, prio, outcome_kind::completed);
-
-                if (self->pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    self->idle_gen_.fetch_add(1, std::memory_order_release);
-                    self->idle_gen_.notify_all();
-                }
+                self->complete_one();
             };
 
             if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
@@ -533,10 +529,7 @@ namespace concurrent {
                 } else {
                     self->trace_end(id, prio, outcome_kind::cancelled);
                 }
-                if (self->pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    self->idle_gen_.fetch_add(1, std::memory_order_release);
-                    self->idle_gen_.notify_all();
-                }
+                self->complete_one();
             };
 
             if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
@@ -571,11 +564,7 @@ namespace concurrent {
             }
             trace_end(st.id, prio, o);
             st.finish(); // 先发布完成再跑续延(续延可能回查本状态)
-
-            if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                idle_gen_.fetch_add(1, std::memory_order_release);
-                idle_gen_.notify_all();
-            }
+            complete_one();
         }
 
         /// 入队, 不含唤醒(批量提交方据此摊薄通知成本)
@@ -587,10 +576,7 @@ namespace concurrent {
                 // 必须与其余完成路径一样推进空闲代际: 若在此裸减计数, 恰好
                 // 挂在 idle_gen_ 上的 shutdown(drain) 将永远等不到唤醒 -
                 // 本次递减可能正是把 pending 归零的那一次
-                if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    idle_gen_.fetch_add(1, std::memory_order_release);
-                    idle_gen_.notify_all();
-                }
+                complete_one();
                 return std::unexpected(submit_error::stopped);
             }
 
@@ -634,6 +620,16 @@ namespace concurrent {
         void notify_wake() noexcept {
             wake_gen_.fetch_add(1, std::memory_order_release);
             wake_gen_.notify_one(); // 单任务只唤醒一个 worker, 避免 notify_all 惊群
+        }
+
+        /// 单个任务完成的统一收尾: 计数归零者负责推进空闲代际并唤醒等待者.
+        /// wait()/shutdown(drain) 挂在 idle_gen_ 上, 任何一条完成路径漏掉
+        /// 这一步都会让它们永久沉睡 - 故所有收尾必须收口于此
+        void complete_one() noexcept {
+            if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                idle_gen_.fetch_add(1, std::memory_order_release);
+                idle_gen_.notify_all();
+            }
         }
 
         static constexpr int level_of(task_priority p) noexcept {
@@ -801,10 +797,7 @@ namespace concurrent {
             // "扣减被销毁节点的计数"互为因果, 将永久自锁
             auto account_drop = [this](node_t* n) noexcept {
                 abandon(n);
-                if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    idle_gen_.fetch_add(1, std::memory_order_release);
-                    idle_gen_.notify_all();
-                }
+                complete_one();
             };
 
             int quiet_rounds = 0;
