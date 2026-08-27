@@ -44,8 +44,8 @@ namespace concurrent {
 
     /// 值标签: queue_cap<Global, Local> - 全局无锁环每层容量与 worker 本地
     /// deque 容量(均须为 2 的幂). 容量决定队列类型尺寸, 故只能做编译期标签.
-    /// 全局环满后溢出链接管(不拒绝不阻塞), 环容量只影响内存占用与快路径
-    /// 占比; 缺省 1024/256
+    /// 全局环满后溢出链接管(不拒绝不阻塞), 环容量影响内存占用与快路径占比;
+    /// 大环吸收多生产者积压, 避免溢出链自旋锁争用; 缺省 65536/256
     template <std::size_t Global = detail::queue_cap_default_global,
               std::size_t Local = detail::queue_cap_default_local>
     inline constexpr detail::queue_cap_flag<Global, Local> queue_cap{};

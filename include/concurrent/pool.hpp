@@ -100,7 +100,8 @@ namespace concurrent {
         static constexpr std::size_t WORKER_CAP = detail::worker_capacity_v<Flags...>;
         /// 本地 deque / 全局环每层容量, queue_cap<Global, Local> 标签可配(2 的幂).
         /// 环满自动落入保序溢出链(不拒绝不阻塞), 故容量只影响内存占用与
-        /// 无锁快路径占比, 不影响正确性; 缺省 256 / 1024
+        /// 无锁快路径占比, 不影响正确性; 大环吸收多生产者积压, 避免溢出链
+        /// 自旋锁争用. 缺省 256 / 65536
         static constexpr std::size_t LOCAL_CAP = detail::queue_local_cap_v<Flags...>;
         static constexpr std::size_t GLOBAL_CAP = detail::queue_global_cap_v<Flags...>;
         static_assert(std::has_single_bit(GLOBAL_CAP),
@@ -1056,7 +1057,7 @@ namespace concurrent {
         std::conditional_t<WORKER_CAP != 0, std::inplace_vector<std::jthread, WORKER_CAP>,
                            std::vector<std::jthread>>
             workers_;
-        /// 全局环体积随容量线性增长(实测 1024 槽 ≈ 64KiB/层, priority 下三层),
+        /// 全局环体积随容量线性增长(65536 槽 ≈ 4MiB/层, priority 下三层),
         /// 堆分配以保持池对象本身可安全栈上构造; 热路径仅多一次指针解引用
         std::unique_ptr<std::array<gq_t, LEVELS>> globals_;
         /// !TRACE 时零尺寸(monostate + [[no_unique_address]]), 三个
