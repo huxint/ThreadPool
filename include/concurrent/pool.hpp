@@ -664,8 +664,17 @@ namespace concurrent {
         }
 
         void notify_wake() noexcept {
-            wake_gen_.fetch_add(1, std::memory_order_release);
-            wake_gen_.notify_one(); // 单任务只唤醒一个 worker, 避免 notify_all 惊群
+            // 稳态下(自旋预算内)没有 worker 在睡, 这次所有生产者共享一行
+            // 的 fetch_add + futex 纯属浪费 - 多生产者 x8 的主要拖累之一.
+            // 不丢唤醒协议(两侧 seq_cst 栅栏, Eigen/taskflow notifier 路数):
+            // 生产者 push 后过栅栏再读 sleepers_; worker 先登记再过栅栏
+            // 复查. 若复查错过 push, 依全序登记必先于本读 - 看到登记便
+            // 照常唤醒, 丢失唤醒不可能
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (sleepers_.load(std::memory_order_acquire) != 0) {
+                wake_gen_.fetch_add(1, std::memory_order_release);
+                wake_gen_.notify_one(); // 单任务只唤醒一个 worker, 避免 notify_all 惊群
+            }
         }
 
         /// 单个任务完成的统一收尾: 计数归零者负责推进空闲代际并唤醒等待者.
@@ -771,12 +780,22 @@ namespace concurrent {
                 }
                 // 睡前最后一搏用 try_acquire 而非只读的 any_work_hint:
                 // 扫的还是同一批队列, 但有活直接拿走执行而非"看到却空手
-                // 回去再来一轮", 全空才睡 - 免竞态协议不变(代际已先读)
+                // 回去再来一轮", 全空才睡 - 免竞态协议不变(代际已先读).
+                //
+                // 睡眠登记与复查之间必须隔一道 seq_cst 栅栏(与 notify_wake
+                // 的生产者侧配对): 若复查错过刚 push 的活, 依全序本次登记
+                // 必先于生产者读 sleepers_ - 后者看到登记便照常唤醒; 若登记
+                // 晚于该读, 则 push 必已对复查可见, 复查不会错过. 两侧必居
+                // 其一, 丢失唤醒不可能
+                sleepers_.fetch_add(1, std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (node_t* m = try_acquire(idx, seed)) {
+                    sleepers_.fetch_sub(1, std::memory_order_relaxed);
                     execute_node(m, idx);
                     continue;
                 }
                 wake_gen_.wait(g); // 全空则睡; 推送方 bump 代际唤醒
+                sleepers_.fetch_sub(1, std::memory_order_relaxed);
             }
 
             detail::tls_pool = nullptr;
@@ -917,6 +936,10 @@ namespace concurrent {
         alignas(64) mutable std::atomic<std::int64_t> pending_{0};
         alignas(64) std::atomic<std::uint64_t> wake_gen_{0};
         alignas(64) mutable std::atomic<std::uint64_t> idle_gen_{0};
+        /// 睡眠中(或正在入睡)的 worker 数. notify_wake 据此在稳态下免去
+        /// 全局代际 RMW; 与 worker 侧的"登记 -> 栅栏 -> 复查"构成不丢唤醒
+        /// 协议, 详见 notify_wake 与 worker_main 的注释
+        alignas(64) std::atomic<std::int64_t> sleepers_{0};
         /// 提交在途计数: "乐观预检通过"到"入队完成"之间的生产者个数.
         /// 与 pending_ 分工 - 它只兜住竞态窗口(置位瞬间仍有生产者越过
         /// 检查), 不计已入队的工作; drain 收敛据此等完最后的在途提交
