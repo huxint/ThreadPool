@@ -21,6 +21,13 @@ namespace concurrent {
 
         template <std::size_t N>
         struct worker_cap_flag {};
+
+        template <std::size_t Global, std::size_t Local>
+        struct queue_cap_flag {};
+
+        /// queue_cap 标签的缺省容量
+        inline constexpr std::size_t queue_cap_default_global = 1024;
+        inline constexpr std::size_t queue_cap_default_local = 256;
     } // namespace detail
 
     /// 特性标签: priority - 启用分层优先级队列
@@ -34,6 +41,14 @@ namespace concurrent {
     /// 不带该标签时使用 std::vector 动态存储
     template <std::size_t N>
     inline constexpr detail::worker_cap_flag<N> worker_cap{};
+
+    /// 值标签: queue_cap<Global, Local> - 全局无锁环每层容量与 worker 本地
+    /// deque 容量(均须为 2 的幂). 容量决定队列类型尺寸, 故只能做编译期标签.
+    /// 全局环满后溢出链接管(不拒绝不阻塞), 环容量只影响内存占用与快路径
+    /// 占比; 缺省 1024/256
+    template <std::size_t Global = detail::queue_cap_default_global,
+              std::size_t Local = detail::queue_cap_default_local>
+    inline constexpr detail::queue_cap_flag<Global, Local> queue_cap{};
 
     namespace detail {
         // 标签以 `inline constexpr` 声明 -> decltype(标签) 携带顶层 const,
@@ -52,6 +67,42 @@ namespace concurrent {
         inline constexpr bool is_worker_cap_flag_impl_v<worker_cap_flag<N>> = true;
         template <typename T>
         inline constexpr bool is_worker_cap_flag_v = is_worker_cap_flag_impl_v<std::remove_cv_t<T>>;
+
+        template <typename T>
+        inline constexpr bool is_queue_cap_flag_impl_v = false;
+        template <std::size_t G, std::size_t L>
+        inline constexpr bool is_queue_cap_flag_impl_v<queue_cap_flag<G, L>> = true;
+        template <typename T>
+        inline constexpr bool is_queue_cap_flag_v = is_queue_cap_flag_impl_v<std::remove_cv_t<T>>;
+
+        /// 提取 queue_cap<Global, Local> 的容量; 0 表示未提供该值
+        template <typename T>
+        struct queue_cap_value_impl {
+            static constexpr std::size_t global = 0;
+            static constexpr std::size_t local = 0;
+        };
+        template <std::size_t G, std::size_t L>
+        struct queue_cap_value_impl<queue_cap_flag<G, L>> {
+            static constexpr std::size_t global = G;
+            static constexpr std::size_t local = L;
+        };
+        template <typename T>
+        struct queue_cap_value : queue_cap_value_impl<std::remove_cv_t<T>> {};
+
+        /// 聚合提取容量(至多一份 queue_cap 标签, 池侧 static_assert 限定):
+        /// 无标签时折叠为 0, 替换为缺省值
+        template <typename... Flags>
+        inline constexpr std::size_t queue_global_cap_v = [] {
+            std::size_t v = std::size_t{0};
+            ((v = std::max(v, queue_cap_value<Flags>::global)), ...);
+            return v != 0 ? v : queue_cap_default_global;
+        }();
+        template <typename... Flags>
+        inline constexpr std::size_t queue_local_cap_v = [] {
+            std::size_t v = std::size_t{0};
+            ((v = std::max(v, queue_cap_value<Flags>::local)), ...);
+            return v != 0 ? v : queue_cap_default_local;
+        }();
 
         template <typename... Flags>
         inline constexpr bool has_priority_v = (is_priority_flag_v<Flags> || ...);

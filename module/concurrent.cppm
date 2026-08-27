@@ -37,6 +37,7 @@ export namespace concurrent {
     // ---- 特性标签 ----
     using concurrent::cancellable;
     using concurrent::priority;
+    using concurrent::queue_cap;
     using concurrent::task_priority;
     using concurrent::trace;
     using concurrent::worker_cap;

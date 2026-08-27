@@ -707,7 +707,7 @@ TEST_SUITE("concurrent.pool") {
         CHECK(total.load() == producers * each);
     }
 
-    // 全局环容量为 GLOBAL_CAP/层, 提交超量后溢出链接管, 任何时刻都不丢任务
+    // 全局环缺省容量 1024/层, 提交超量后溢出链接管, 任何时刻都不丢任务
     TEST_CASE("global_queue_overflow_no_loss") {
         constexpr int n = 20000;
         pool p({.threads = 2});
@@ -729,6 +729,75 @@ TEST_SUITE("concurrent.pool") {
         p.wait();
         CHECK(accepted == n);
         CHECK(done.load() == n);
+    }
+
+    // queue_cap 标签: 把两级容量都压到最小, 大批量提交几乎全程走溢出链,
+    // 仍须一个不丢(正确性不依赖容量, 容量只影响快路径占比与内存)
+    TEST_CASE("queue_cap_tiny_capacities_no_loss") {
+        basic_pool<decltype(queue_cap<8, 2>)> p({.threads = 2});
+        constexpr int n = 5000;
+        tu::gate g;
+        g.block_all(p, 2);
+
+        std::atomic<int> done{0};
+        std::jthread releaser([&g] {
+            std::this_thread::sleep_for(80ms);
+            g.release();
+        });
+
+        int accepted = 0;
+        for (int i = 0; i < n; ++i) {
+            if (p.execute([&done]() noexcept { done.fetch_add(1, std::memory_order_relaxed); })) {
+                ++accepted;
+            }
+        }
+        p.wait();
+        CHECK(accepted == n);
+        CHECK(done.load() == n);
+    }
+
+    // 本地 deque 容量 2: worker 内嵌套提交溢出本地后落入全局, 不丢不拒
+    TEST_CASE("queue_cap_local_overflow_falls_to_global") {
+        basic_pool<decltype(queue_cap<1024, 2>)> p({.threads = 1});
+        std::atomic<int> done{0};
+        constexpr int children = 100;
+        static_cast<void>(p.execute([&p, &done]() noexcept {
+            // 父任务独占唯一 worker, 100 个子任务无人消费 -> 本地 2 槽必然溢出
+            for (int i = 0; i < children; ++i) {
+                static_cast<void>(p.execute([&done]() noexcept {
+                    done.fetch_add(1, std::memory_order_relaxed);
+                }));
+            }
+        }));
+        p.wait();
+        CHECK(done.load() == children);
+    }
+
+    // 自旋预算 0: worker 不自旋直接睡眠, 唤醒协议须仍然无损
+    TEST_CASE("spin_budget_zero_still_processes_all") {
+        pool p({.threads = 2, .spin_budget = 0us});
+        constexpr int n = 2000;
+        std::atomic<int> done{0};
+        for (int i = 0; i < n; ++i) {
+            static_cast<void>(p.execute([&done]() noexcept {
+                done.fetch_add(1, std::memory_order_relaxed);
+            }));
+        }
+        p.wait();
+        CHECK(done.load() == n);
+    }
+
+    // 自旋预算可放大: 稀疏流量下仍正确(睡得更晚不改变协议)
+    TEST_CASE("spin_budget_explicit_large") {
+        pool p({.threads = 2, .spin_budget = 5ms});
+        std::atomic<int> done{0};
+        for (int i = 0; i < 100; ++i) {
+            static_cast<void>(p.execute([&done]() noexcept {
+                done.fetch_add(1, std::memory_order_relaxed);
+            }));
+        }
+        p.wait();
+        CHECK(done.load() == 100);
     }
 
     TEST_CASE("single_worker_preserves_fifo_order") {

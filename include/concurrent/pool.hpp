@@ -79,12 +79,15 @@ namespace concurrent {
      * 取消: 所有状态无条件内嵌 stop_source, 未开跑即取消的任务体被跳过并标记
      * operation_cancelled
      *
-     * @tparam Flags 特性标签: priority / cancellable / trace / worker_cap<N>
+     * @tparam Flags 特性标签: priority / cancellable / trace / worker_cap<N> /
+     *                queue_cap<Global, Local>
      */
     template <typename... Flags>
     class basic_pool {
         static_assert((std::size_t{0} + ... + detail::is_worker_cap_flag_v<Flags>) <= 1,
                       "worker_cap<N> may appear at most once");
+        static_assert((std::size_t{0} + ... + detail::is_queue_cap_flag_v<Flags>) <= 1,
+                      "queue_cap<Global, Local> may appear at most once");
 
         static constexpr bool PRIORITY = detail::has_priority_v<Flags...>;
         static constexpr bool TRACE = detail::has_trace_v<Flags...>;
@@ -93,17 +96,18 @@ namespace concurrent {
         static constexpr bool CANCELLABLE_TAG = detail::has_cancellable_v<Flags...>;
         static constexpr int LEVELS = PRIORITY ? 3 : 1;
         static constexpr std::size_t WORKER_CAP = detail::worker_capacity_v<Flags...>;
-        static constexpr std::size_t LOCAL_CAP = 256; ///< 本地 deque 容量(2 的幂)
-        static constexpr std::size_t GLOBAL_CAP =
-            16384; ///< 全局无锁环容量/层(超出部分落入保序溢出链)
+        /// 本地 deque / 全局环每层容量, queue_cap<Global, Local> 标签可配(2 的幂).
+        /// 环满自动落入保序溢出链(不拒绝不阻塞), 故容量只影响内存占用与
+        /// 无锁快路径占比, 不影响正确性; 缺省 256 / 1024
+        static constexpr std::size_t LOCAL_CAP = detail::queue_local_cap_v<Flags...>;
+        static constexpr std::size_t GLOBAL_CAP = detail::queue_global_cap_v<Flags...>;
+        static_assert(GLOBAL_CAP != 0 && (GLOBAL_CAP & (GLOBAL_CAP - 1)) == 0,
+                      "queue_cap<Global, Local>: Global must be a nonzero power of two");
+        static_assert(LOCAL_CAP >= 2 && (LOCAL_CAP & (LOCAL_CAP - 1)) == 0,
+                      "queue_cap<Global, Local>: Local must be a power of two >= 2");
         /// 每 worker 空闲节点缓存上限. 无上限时外部线程持续提交会让缓存长度
         /// 随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不来取)
         static constexpr std::size_t NODE_CACHE_CAP = 1024;
-        /// 睡眠前的忙等时间预算: 任务常成簇到达(嵌套提交, 往返模式),
-        /// 一小段自旋即可吸收"生产者已在路上"的窗口, 免去每次 futex 睡/醒
-        /// 的内核往返 - 实测将空池往返 P50 从 ~55µs 降至亚微秒级
-        /// 以时间而非次数计, 跨主频可移植; 到期仍无任务才真正睡眠
-        static constexpr auto SPIN_BUDGET = std::chrono::microseconds(64);
         static constexpr int PAUSE_BATCH = 16; ///< 每轮探测间的让核步长
 
         using node_t = detail::task_node;
@@ -115,7 +119,14 @@ namespace concurrent {
     public:
         struct options {
             std::size_t threads = 0; ///< 0 -> hardware_concurrency()
-            trace_hooks hooks{};     ///< 仅 trace 标签下生效
+            /// 睡眠前忙等时间预算. 任务常成簇到达(嵌套提交, 往返模式), 一小段
+            /// 自旋即可吸收"生产者已在路上"的窗口, 免去每次 futex 睡/醒的内核
+            /// 往返 - 实测将空池往返 P50 从 ~55µs 降至亚微秒级. 以时间而非
+            /// 次数计, 跨主频可移植; 到期仍无任务才真正睡眠. 0 = 不自旋直接
+            /// 睡. 另一面: 任务到达间隔稳定小于该值时 N 个 worker 会全程占核,
+            /// 稀疏流量的服务型池宜调小
+            std::chrono::microseconds spin_budget{64};
+            trace_hooks hooks{}; ///< 仅 trace 标签下生效
         };
 
         /**
@@ -129,7 +140,7 @@ namespace concurrent {
          */
         explicit basic_pool(options opts = {}) pre(opts.threads <= 65536)
             pre(WORKER_CAP == 0 || opts.threads <= WORKER_CAP)
-            : hooks_(std::move(opts.hooks)) {
+            : hooks_(std::move(opts.hooks)), spin_budget_(opts.spin_budget) {
             n_threads_ = opts.threads
                              ? opts.threads
                              : std::max<std::size_t>(std::jthread::hardware_concurrency(), 1);
@@ -751,9 +762,10 @@ namespace concurrent {
 
             while (true) {
                 node_t* n = try_acquire(idx, seed);
-                if (!n) {
-                    // 有界自旋: 每批让核后重新探测全队列; 预算耗尽才进入 futex 睡眠
-                    const auto deadline = std::chrono::steady_clock::now() + SPIN_BUDGET;
+                if (!n && spin_budget_ > std::chrono::microseconds{0}) {
+                    // 有界自旋: 每批让核后重新探测全队列; 预算耗尽(或配置为 0)
+                    // 才进入 futex 睡眠协议
+                    const auto deadline = std::chrono::steady_clock::now() + spin_budget_;
                     while (!n) {
                         for (int s = 0; s < PAUSE_BATCH && !n; ++s) {
                             detail::cpu_relax();
@@ -966,11 +978,13 @@ namespace concurrent {
         std::conditional_t<WORKER_CAP != 0, std::inplace_vector<std::jthread, WORKER_CAP>,
                            std::vector<std::jthread>>
             workers_;
-        /// 全局环体积可观(16384 槽 x 64B ≈ 1MiB/层), 堆分配以保持池对象
-        /// 本身可安全栈上构造; 热路径仅多一次指针解引用
+        /// 全局环体积随容量线性增长(实测 1024 槽 ≈ 64KiB/层, priority 下三层),
+        /// 堆分配以保持池对象本身可安全栈上构造; 热路径仅多一次指针解引用
         std::unique_ptr<std::array<gq_t, LEVELS>> globals_;
         trace_hooks hooks_;
         std::size_t n_threads_ = 0;
+        /// 睡前忙等预算(options::spin_budget, 构造后只读)
+        std::chrono::microseconds spin_budget_{64};
     };
 
     /// 默认别名: 无特性的基础形态
