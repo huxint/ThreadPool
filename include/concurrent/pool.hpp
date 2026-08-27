@@ -2,6 +2,7 @@
 #include "concurrent/detail/chase_lev.hpp"
 #include "concurrent/detail/cpu_relax.hpp"
 #include "concurrent/detail/global_queue.hpp"
+#include "concurrent/detail/mpmc_ring.hpp"
 #include "concurrent/detail/node_cache.hpp"
 #include "concurrent/tags.hpp"
 #include "concurrent/task.hpp"
@@ -109,6 +110,10 @@ namespace concurrent {
         /// 每 worker 空闲节点缓存上限. 无上限时外部线程持续提交会让缓存长度
         /// 随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不来取)
         static constexpr std::size_t NODE_CACHE_CAP = 1024;
+        /// 全局空闲节点池上限: worker 本地缓存溢出时归还于此, 供外部生产者
+        /// 跨线程复用. 无此环节则每任务一次跨线程 free, fire-and-forget
+        /// 吞吐掉约 4 倍(见 A3 回退修复)
+        static constexpr std::size_t NODE_POOL_CAP = 4096;
         /// stopping_ 置位后 worker 嵌套提交的放行预算: 防"自适应派生"型任务
         /// (派生速率不衰减)在关闭窗口内无限繁殖令 shutdown 永不返回.
         /// 覆盖约 depth-21 满二叉树的派生量, 耗尽退回拒绝(stopped);
@@ -119,6 +124,7 @@ namespace concurrent {
         using node_t = detail::task_node;
         using gq_t = detail::global_queue<node_t, GLOBAL_CAP>;
         using worker_ctx_t = detail::worker_ctx<LEVELS, LOCAL_CAP, NODE_CACHE_CAP>;
+        using node_pool_t = detail::mpmc_ring<node_t*, NODE_POOL_CAP>;
         using outcome_kind = task_outcome;
         using phase_kind = task_phase;
 
@@ -161,6 +167,7 @@ namespace concurrent {
                 ctxs_[i].index = i;
             }
             try {
+                node_pool_ = std::make_unique<node_pool_t>();
                 globals_ = std::make_unique<std::array<gq_t, LEVELS>>();
                 spawn_workers();
             } catch (...) {
@@ -715,9 +722,12 @@ namespace concurrent {
             // 带进队列, 关闭丢弃时 abandon 便在已释放的状态上写入
             n->discard = nullptr;
             n->discard_ctx = nullptr;
-            // 缓存已满则直接归还分配器: 节点此刻已是干净空壳
+            // 归还顺序: 本地缓存(嵌套提交复用) -> 全局空闲池(外部生产者
+            // 跨线程复用) -> 分配器. 节点此刻已是干净空壳
             if (!ctxs_[worker].cache.push(n)) {
-                delete n;
+                if (!node_pool_->try_push(n)) {
+                    delete n;
+                }
             }
         }
 
@@ -755,6 +765,12 @@ namespace concurrent {
                 if (auto* n = ctxs_[detail::tls_worker].cache.pop()) [[likely]] {
                     return n;
                 }
+            }
+            // 跨线程复用: worker 归还的空闲节点经全局池回流转给外部生产者,
+            // 省去每任务一次 malloc + 一次跨线程 free(否则 fire-and-forget
+            // 单生产者吞吐掉约 4 倍)
+            if (auto* n = node_pool_->try_pop()) [[likely]] {
+                return n;
             }
             return new (std::nothrow) node_t{};
         }
@@ -968,6 +984,9 @@ namespace concurrent {
                     abandon(n); // 缓存节点钩子已清, 经统一出口仅为结构一致
                 }
             }
+            while (auto* n = node_pool_->try_pop()) {
+                abandon(n);
+            }
         }
 
         [[nodiscard]]
@@ -1031,6 +1050,9 @@ namespace concurrent {
         std::atomic<std::int64_t> drain_nested_budget_{DRAIN_NESTED_BUDGET};
 
         std::unique_ptr<worker_ctx_t[]> ctxs_;
+        /// 全局空闲节点池(MPMC 有界环): 外部生产者与 worker 之间的节点流转
+        /// 复用. 堆分配以保持池对象本身可安全栈上构造(同 globals_)
+        std::unique_ptr<node_pool_t> node_pool_;
         std::conditional_t<WORKER_CAP != 0, std::inplace_vector<std::jthread, WORKER_CAP>,
                            std::vector<std::jthread>>
             workers_;
