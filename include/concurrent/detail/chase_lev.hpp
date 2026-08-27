@@ -67,6 +67,13 @@ namespace concurrent::detail {
         /// 任意线程调用. FIFO 偷取队头; 空或竞争失败返回 nullptr
         [[nodiscard]]
         T steal() noexcept {
+            // 无栅栏预检: 空队列直接走人, 不付 Dekker 栅栏的代价. 误判"空"
+            // 完全良性(调用方本就容忍偷取失败), 漏判由下方完整路径兜住.
+            // 空闲 worker 在自旋预算里反复扫 n_threads x LEVELS 个 victim,
+            // 稳态下全部命中此快路径
+            if (top_.load(std::memory_order_relaxed) >= bottom_.load(std::memory_order_relaxed)) {
+                return nullptr;
+            }
             std::size_t t = top_.load(std::memory_order_acquire);
             std::atomic_thread_fence(std::memory_order_seq_cst); // 与 pop 的 bottom 递减定序
             std::size_t b = bottom_.load(std::memory_order_acquire);

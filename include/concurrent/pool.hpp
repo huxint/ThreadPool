@@ -683,14 +683,14 @@ namespace concurrent {
             std::uint32_t seed = static_cast<std::uint32_t>(idx) * 0x9E3779B9u + 1u;
 
             while (true) {
-                node_t* n = try_acquire(seed);
+                node_t* n = try_acquire(idx, seed);
                 if (!n) {
                     // 有界自旋: 每批让核后重新探测全队列; 预算耗尽才进入 futex 睡眠
                     const auto deadline = std::chrono::steady_clock::now() + SPIN_BUDGET;
                     while (!n) {
                         for (int s = 0; s < PAUSE_BATCH && !n; ++s) {
                             detail::cpu_relax();
-                            n = try_acquire(seed);
+                            n = try_acquire(idx, seed);
                         }
                         if (n || std::chrono::steady_clock::now() >= deadline) {
                             break;
@@ -721,7 +721,7 @@ namespace concurrent {
                 // 睡前最后一搏用 try_acquire 而非只读的 any_work_hint:
                 // 扫的还是同一批队列, 但有活直接拿走执行而非"看到却空手
                 // 回去再来一轮", 全空才睡 - 免竞态协议不变(代际已先读)
-                if (node_t* m = try_acquire(seed)) {
+                if (node_t* m = try_acquire(idx, seed)) {
                     execute_node(m, idx);
                     continue;
                 }
@@ -732,9 +732,10 @@ namespace concurrent {
         }
 
         /// 取一个任务: 自有本地(高->低) -> 全局(高->低) -> 窃取他人本地(FIFO)
+        /// worker 身份由调用方传入: worker_main 手上就有 idx, 免去 TLS 读
         [[nodiscard]]
-        node_t* try_acquire(std::uint32_t& seed) noexcept {
-            auto& self = ctxs_[detail::tls_worker];
+        node_t* try_acquire(std::size_t idx, std::uint32_t& seed) noexcept {
+            auto& self = ctxs_[idx];
             for (int lv = 0; lv < LEVELS; ++lv) {
                 if (auto* n = self.local[lv].pop()) [[likely]]
                 {
@@ -747,9 +748,12 @@ namespace concurrent {
                 }
             }
             const std::size_t start = xorshift(seed) % n_threads_;
-            for (std::size_t k = 1; k <= n_threads_; ++k) {
-                const std::size_t vi = (start + k) % n_threads_;
-                if (vi == detail::tls_worker) {
+            std::size_t vi = start;
+            for (std::size_t k = 0; k < n_threads_; ++k) {
+                if (++vi == n_threads_) {
+                    vi = 0;
+                }
+                if (vi == idx) {
                     continue;
                 }
                 auto& victim = ctxs_[vi];
