@@ -2,9 +2,36 @@
 // 测试公共工具: 与框架无关的异步观测辅助, 断言一律使用 doctest 宏
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 namespace tu {
+
+    // 挂死看门狗. 死锁类回归测试一旦失败, 表现是整个测试进程卡住, CI 只能等到
+    // 超时且不知卡在哪. 以此把"挂死"转成一次带明确诊断的立即中止
+    class deadlock_watchdog {
+    public:
+        deadlock_watchdog(std::chrono::seconds limit, const char* what)
+            : t_([limit, what](std::stop_token st) {
+                  const auto deadline = std::chrono::steady_clock::now() + limit;
+                  while (!st.stop_requested()) {
+                      if (std::chrono::steady_clock::now() >= deadline) {
+                          std::fprintf(stderr, "\n[deadlock_watchdog] \"%s\" not finished within %lld s, deadlock assumed\n",
+                                       what, static_cast<long long>(limit.count()));
+                          std::fflush(stderr);
+                          std::abort();
+                      }
+                      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                  }
+              }) {}
+
+        deadlock_watchdog(const deadlock_watchdog&) = delete;
+        deadlock_watchdog& operator=(const deadlock_watchdog&) = delete;
+
+    private:
+        std::jthread t_;
+    };
 
     // 用若干自旋占位任务卡住全部 worker, 使随后提交的任务必然处于排队状态
     struct gate {

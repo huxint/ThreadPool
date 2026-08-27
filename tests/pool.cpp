@@ -273,6 +273,54 @@ TEST_SUITE("concurrent.pool") {
         }
     }
 
+    // 回归: shutdown(drain) 与并发提交之间曾有三条独立的挂死路径 -
+    //   1. 提交被拒时裸减 pending 而不推进空闲代际, 挂在 idle_gen_ 上的
+    //      wait() 等不到唤醒(修复前实测第 8~27 轮复现)
+    //   2. worker 以 stopping_ 为退出判据, 会在 drain 的 wait() 期间集体离场,
+    //      而"已越过拒绝检查"的在途提交随后才落队 -> pending 永不归零
+    //      (修复前实测第 187~331 轮复现)
+    //   3. worker 先检查退出条件再读 wake_gen_, 若两者之间恰好发生置位+递增,
+    //      wait(g) 将永久阻塞 -> workers_.clear() 的 join 挂死
+    //
+    // 本用例按 1 与 2 的窗口定规模, 二者稳定复现. 路径 3 的窗口只有相邻两条
+    // load 指令, 实测需上万轮才偶发一次(1200 轮检出率约 1/9), 靠堆轮数不划算 -
+    // 其正确性由 worker_main 中"代际先于判据读取"的协议注释与推导保证
+    TEST_CASE("shutdown_drain_race_with_submit_no_hang") {
+        tu::deadlock_watchdog wd{60s, "shutdown_drain_race_with_submit_no_hang"};
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+        constexpr int rounds = 200; // 消毒器下单轮成本高一个量级, 相应缩减
+#else
+        constexpr int rounds = 1500;
+#endif
+        constexpr int producers = 8;
+
+        int completed = 0;
+        for (int r = 0; r < rounds; ++r) {
+            pool p({.threads = 2});
+            std::atomic<bool> go{false};
+            std::vector<std::jthread> prods;
+            prods.reserve(producers);
+            for (int i = 0; i < producers; ++i) {
+                prods.emplace_back([&p, &go] {
+                    while (!go.load(std::memory_order_acquire)) {
+                    }
+                    for (int k = 0; k < 256; ++k) {
+                        static_cast<void>(p.execute([]() noexcept {}));
+                    }
+                });
+            }
+            go.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(20us); // 让提交进入在途状态
+
+            p.shutdown(shutdown_policy::drain); // 返回即证明未挂死
+            prods.clear();
+            if (!p.running()) {
+                ++completed;
+            }
+        }
+        CHECK(completed == rounds);
+    }
+
     TEST_CASE("wait_for_timeout_and_completion") {
         pool p({.threads = 1});
         tu::gate g;

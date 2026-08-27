@@ -413,6 +413,9 @@ namespace concurrent {
             // 并发拆除会破坏之; workers_.clear() 更是裸数据竞争 -> 串行化
             std::lock_guard lock{shutdown_mtx_};
             drop_all_queued(); // discard 的主体; drain 时仅收敛在途提交的残留
+            // 只有排空收敛之后才允许 worker 退出: 在此之前它们是队列的唯一
+            // 消费者, 提前离场会让"已越过拒绝检查的在途提交"无人认领
+            quitting_.store(true, std::memory_order_release);
             wake_gen_.fetch_add(1, std::memory_order_release);
             wake_gen_.notify_all();
             workers_.clear(); // jthread 析构 join
@@ -597,7 +600,13 @@ namespace concurrent {
             pending_.fetch_add(1, std::memory_order_acq_rel);
             if (stopping_.load(std::memory_order_acquire)) [[unlikely]] {
                 destroy_node(node);
-                pending_.fetch_sub(1, std::memory_order_acq_rel);
+                // 必须与其余完成路径一样推进空闲代际: 若在此裸减计数, 恰好
+                // 挂在 idle_gen_ 上的 shutdown(drain) 将永远等不到唤醒 -
+                // 本次递减可能正是把 pending 归零的那一次
+                if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    idle_gen_.fetch_add(1, std::memory_order_release);
+                    idle_gen_.notify_all();
+                }
                 return std::unexpected(submit_error::stopped);
             }
 
@@ -676,6 +685,7 @@ namespace concurrent {
         /// 再 join, 最后清空节点缓存. 之后异常方可继续传播
         void abort_partial_construction() noexcept {
             stopping_.store(true, std::memory_order_release);
+            quitting_.store(true, std::memory_order_release);
             wake_gen_.fetch_add(1, std::memory_order_release);
             wake_gen_.notify_all();
             workers_.clear();
@@ -706,13 +716,23 @@ namespace concurrent {
                     execute_node(n, idx);
                     continue;
                 }
-                // stop_token 是兜底退出条件: jthread 析构会 request_stop 后 join,
-                // 即便某条路径漏了 stopping_ 也不会挂死在 join 上
-                if (stopping_.load(std::memory_order_acquire) || stop.stop_requested())
+                // 免竞态睡眠协议: 代际必须先于"退出条件"与"有无工作"读取.
+                // 二者的置位方都在改动后递增 wake_gen_, 故任何发生在本次读取
+                // 之后的置位都会让下面的 wait(g) 立即返回; 反之若代际未变, 则
+                // 置位方的写入必已先于本次 acquire 读可见, 下面两项检查看得到
+                const std::uint64_t g = wake_gen_.load(std::memory_order_acquire);
+
+                // 判据是 quitting_ 而非 stopping_: 后者仅表示"拒绝新提交",
+                // 此时 drain 还要靠 worker 把队列消费干净. 若以 stopping_ 退出,
+                // worker 会在 shutdown(drain) 的 wait() 期间集体离场, 而"已越过
+                // 拒绝检查"的在途提交随后才落队 -> pending 永不归零, wait() 悬挂
+                //
+                // stop_token 是兜底: jthread 析构会 request_stop 后 join,
+                // 即便某条路径漏了 quitting_ 也不会挂死在 join 上
+                if (quitting_.load(std::memory_order_acquire) || stop.stop_requested())
                     [[unlikely]] {
                     break;
                 }
-                std::uint64_t g = wake_gen_.load(std::memory_order_acquire);
                 if (any_work_hint()) {
                     continue;
                 }
@@ -873,6 +893,9 @@ namespace concurrent {
         /// route 的每次提交都 acquire 读 stopping_; 与高频递增的 id_seq_
         /// 各占一行, 避免读写互弹缓存行
         alignas(64) std::atomic<bool> stopping_{false};
+        /// worker 的退出判据. 与 stopping_ 分离: 前者一置位即拒绝新提交, 而
+        /// worker 必须继续消费到排空收敛之后才可离场
+        alignas(64) std::atomic<bool> quitting_{false};
         alignas(64) std::atomic<std::uint64_t> id_seq_{0};
 
         /// 仅拆除路径使用; 与热路径原子量无共享行
