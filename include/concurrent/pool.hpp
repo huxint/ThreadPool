@@ -235,7 +235,6 @@ namespace concurrent {
 
             std::vector<task<R>> out;
             std::vector<node_t*> staged;
-            [[maybe_unused]] std::vector<std::uint64_t> ids;
 
             // 阶段一: 整体构建. 任一失败回滚全部半成品(终结状态防悬挂)
             try {
@@ -243,9 +242,6 @@ namespace concurrent {
                     const auto n = static_cast<std::size_t>(std::ranges::size(rng));
                     out.reserve(n);
                     staged.reserve(n);
-                    if constexpr (TRACE) {
-                        ids.reserve(n);
-                    }
                 }
                 for (auto&& e : rng) {
                     std::shared_ptr<detail::shared_state<R>> st;
@@ -258,9 +254,6 @@ namespace concurrent {
                         return std::unexpected(submit_error::out_of_memory);
                     }
                     staged.push_back(node);
-                    if constexpr (TRACE) {
-                        ids.push_back(st->id);
-                    }
                     out.emplace_back(std::move(st));
                 }
             } catch (...) { // F/元素拷贝的用户异常原样透传, 半成品照旧回收
@@ -280,8 +273,8 @@ namespace concurrent {
                     }
                     return std::unexpected(ok.error());
                 }
-                if constexpr (TRACE) { // 关闭时不求值 ids[i](空向量)
-                    trace_enqueue(ids[i], task_priority::normal);
+                if constexpr (TRACE) { // id 就在手边: out[i] 持有同一份状态
+                    trace_enqueue(out[i].st_->id, task_priority::normal);
                 }
             }
             if (!staged.empty()) {
