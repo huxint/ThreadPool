@@ -11,11 +11,13 @@ namespace concurrent::detail {
     class spinlock {
     public:
         void lock() noexcept {
+            int spins = 0;
             while (flag_.test_and_set(std::memory_order_acquire)) {
-                while (
-                    flag_.test(std::memory_order_relaxed)) { // 先只读探测, 避免独占缓存行的写风暴
+                // 指数退避: 高争用下等待者自旋自自己的缓存行, 收敛惊群效应
+                for (int i = 0; i < (1 << (spins < 8 ? spins : 8)); ++i) {
                     cpu_relax();
                 }
+                ++spins;
             }
         }
 
