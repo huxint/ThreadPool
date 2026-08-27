@@ -71,6 +71,25 @@ if(BUILD_MODULE)
     add_test(NAME concurrent_module_smoke COMMAND concurrent_module_smoke)
 endif()
 
+# -DWITH_STDEXEC=ON -DSTDEXEC_ROOT=<含 stdexec/ 的目录>: P2300 scheduler 集成
+# 可选依赖, 不进核心构建; 核心库保持零依赖 header-only
+option(WITH_STDEXEC "build stdexec (P2300) scheduler integration tests" OFF)
+if(WITH_STDEXEC)
+    if(NOT STDEXEC_ROOT)
+        message(FATAL_ERROR "WITH_STDEXEC=ON requires -DSTDEXEC_ROOT=<include root containing stdexec/>")
+    endif()
+    add_executable(concurrent_stdexec_tests tests/stdexec.cpp)
+    target_link_libraries(concurrent_stdexec_tests PRIVATE concurrent)
+    # SYSTEM: 第三方头告警不属于本库承诺的零警告面
+    target_include_directories(concurrent_stdexec_tests SYSTEM PRIVATE ${STDEXEC_ROOT})
+    target_include_directories(concurrent_stdexec_tests PRIVATE tests tests/third_party)
+    concurrent_own_compile_options(concurrent_stdexec_tests)
+    # 关闭模块依赖扫描: 扫描注入的 -fmodules-ts 与 stdexec 头在 GCC 16 上
+    # 触发编译器内部错误(本目标无模块单元, 扫描本无必要)
+    set_target_properties(concurrent_stdexec_tests PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+    add_test(NAME concurrent_stdexec_tests COMMAND concurrent_stdexec_tests)
+endif()
+
 if(SANITIZER STREQUAL "thread")
     set_tests_properties(concurrent_tests PROPERTIES
         ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
