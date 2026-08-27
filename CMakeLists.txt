@@ -10,8 +10,6 @@ file(CREATE_LINK "${CMAKE_BINARY_DIR}/compile_commands.json"
 find_package(Threads REQUIRED)
 include(CTest)
 
-add_compile_options(-Wall -Wextra -Wshadow)
-
 # -DSANITIZER=address|thread, UBSan always layered on top
 set(SANITIZER "" CACHE STRING "sanitizer: address or thread")
 if(SANITIZER)
@@ -20,28 +18,42 @@ if(SANITIZER)
     add_link_options(-fsanitize=${SANITIZER},undefined)
 endif()
 
-# Header-only library. Contracts enforce in Debug, ignore otherwise.
+# Header-only library. 契约语法写在公共头里, 消费方 TU 须以 -fcontracts 才能解析:
+# 经 INTERFACE 注入但仅限 GCC - Clang 无此 flag, 之前被一刀切强制, 完全无法
+# 消费; 契约求值语义不再随之强加, 交由下游自选
 add_library(concurrent INTERFACE)
 target_include_directories(concurrent INTERFACE include)
 target_compile_features(concurrent INTERFACE cxx_std_26)
 target_link_libraries(concurrent INTERFACE Threads::Threads)
-target_compile_options(
-    concurrent INTERFACE
-    -fcontracts $<IF:$<CONFIG:Debug>,-fcontract-evaluation-semantic=enforce,-fcontract-evaluation-semantic=ignore>)
-target_link_options(concurrent INTERFACE -fcontracts)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(concurrent INTERFACE -fcontracts)
+    target_link_options(concurrent INTERFACE -fcontracts)
+endif()
+
+# 自有目标的编译面: 警告(收窄到 PRIVATE, 不再全局 add_compile_options,
+# 不波及 taskflow/doctest 等第三方头) + 契约求值语义(自有目标 Debug 下
+# enforce, 其余 ignore; 不挂 INTERFACE, 不随之下发)
+function(concurrent_own_compile_options tgt)
+    target_compile_options(
+        ${tgt} PRIVATE -Wall -Wextra -Wshadow
+        $<IF:$<CONFIG:Debug>,-fcontract-evaluation-semantic=enforce,-fcontract-evaluation-semantic=ignore>)
+endfunction()
 
 add_executable(concurrent_example src/main.cpp)
 target_link_libraries(concurrent_example PRIVATE concurrent)
+concurrent_own_compile_options(concurrent_example)
 
 add_executable(concurrent_tests tests/main.cpp tests/pool.cpp tests/task.cpp tests/parallel.cpp
                                 tests/detail.cpp)
 target_link_libraries(concurrent_tests PRIVATE concurrent)
 target_include_directories(concurrent_tests PRIVATE tests tests/third_party)
+concurrent_own_compile_options(concurrent_tests)
 add_test(NAME concurrent_tests COMMAND concurrent_tests)
 
 add_executable(concurrent_bench benchmarks/bench.cpp)
 target_link_libraries(concurrent_bench PRIVATE concurrent)
 target_include_directories(concurrent_bench PRIVATE benchmarks benchmarks/third_party/taskflow_repo)
+concurrent_own_compile_options(concurrent_bench)
 
 # -DBUILD_MODULE=ON: module wrapper `concurrent.pool` (requires Ninja)
 option(BUILD_MODULE "build the concurrent.pool module wrapper" OFF)
@@ -50,10 +62,12 @@ if(BUILD_MODULE)
     target_sources(concurrent_module PUBLIC FILE_SET CXX_MODULES FILES module/concurrent.cppm)
     target_link_libraries(concurrent_module PUBLIC concurrent)
     set_target_properties(concurrent_module PROPERTIES CXX_SCAN_FOR_MODULES ON)
+    concurrent_own_compile_options(concurrent_module)
 
     add_executable(concurrent_module_smoke module/smoke.cpp)
     target_link_libraries(concurrent_module_smoke PRIVATE concurrent_module)
     set_target_properties(concurrent_module_smoke PROPERTIES CXX_SCAN_FOR_MODULES ON)
+    concurrent_own_compile_options(concurrent_module_smoke)
     add_test(NAME concurrent_module_smoke COMMAND concurrent_module_smoke)
 endif()
 
