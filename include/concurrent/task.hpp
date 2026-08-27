@@ -72,7 +72,9 @@ namespace concurrent {
         ///
         /// 两个链接字段服务于互斥的三种归属(环/溢出链, 空闲链), 故不会同时使用:
         struct task_node {
-            sbo_function<64> body;
+            /// SBO=64 时节点 112B 落 malloc 128B 桶(浪费 16); 80 恰好 128B
+            /// 填满桶, 96 则跨到 160B 桶. 80 是零内存代价下的最大容量
+            sbo_function<80> body;
             /// 排队中被关闭丢弃时的状态收尾(仅 submit 路径设置). 必须先于
             /// body 析构调用: 闭包持有共享状态引用, 若随节点直接湮灭,
             /// 用户侧 get() 将在 done 等待上永久阻塞

@@ -703,9 +703,10 @@ TEST_SUITE("concurrent.pool") {
 
     // 回归: 空闲节点缓存必须设上限. 无上限时外部线程持续提交会让每 worker 的
     // 缓存随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不取).
-    // Linux-only 粗粒度冒烟: 百万次外部 execute 后 RSS 增量须低于宽松上界
+    // Linux-only 粗粒度冒烟: 百万次外部 execute 后 RSS 增量须低于宽松上界.
+    // ASan 构建跳过: quarantine 把已归还内存滞留计费, RSS 不再反映真实滞留
     TEST_CASE("node_cache_bounded_rss_under_external_execute") {
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__SANITIZE_ADDRESS__)
         auto rss_pages = [] {
             std::FILE* f = std::fopen("/proc/self/statm", "re");
             if (!f) {
@@ -746,7 +747,7 @@ TEST_SUITE("concurrent.pool") {
             CHECK(delta_mb < 64);
         }
 #else
-        (void)0; // 非 Linux: 静默跳过
+        (void)0; // 非 Linux 或 ASan: 静默跳过
 #endif
     }
 }
