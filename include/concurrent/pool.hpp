@@ -942,7 +942,20 @@ namespace concurrent {
                 } else {
                     quiet_rounds = 0;
                     if (got == 0) {
-                        std::this_thread::yield(); // 计数由在途任务/提交持有: 让出 CPU 等其收尾
+                        if (pending_.load(std::memory_order_acquire) != 0) {
+                            // 计数由在途任务持有: 挂在空闲代际上而非 yield 空转 -
+                            // discard 期长任务在跑时, 本线程原先会烧满整个任务
+                            // 时长. 复检后仍非零才睡(complete_one 把"归零"与
+                            // bump/notify 原子配对, 不会睡过终点); 虚假唤醒由
+                            // 外层轮次结构容忍
+                            const std::uint64_t g = idle_gen_.load(std::memory_order_acquire);
+                            if (pending_.load(std::memory_order_acquire) != 0) {
+                                idle_gen_.wait(g);
+                            }
+                        } else {
+                            // 仅 submitting_ 残留(越过检查但未落队, 窗口极窄): 让出 CPU
+                            std::this_thread::yield();
+                        }
                     }
                 }
             }
