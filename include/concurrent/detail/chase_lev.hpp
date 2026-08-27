@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <type_traits>
 
@@ -18,7 +19,7 @@ namespace concurrent::detail {
     ///
     /// bottom 端仅所有者操作(LIFO), top 端被窃取者竞争(FIFO)
     template <typename T, std::size_t Capacity>
-        requires((Capacity & (Capacity - 1)) == 0 && Capacity >= 2 &&
+        requires(std::has_single_bit(Capacity) && Capacity >= 2 &&
                  std::is_trivially_copyable_v<T>)
     class chase_lev_deque {
         static constexpr std::size_t mask = Capacity - 1;

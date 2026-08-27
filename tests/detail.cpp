@@ -11,7 +11,28 @@
 
 using namespace concurrent::detail;
 
+// 概念探测: 约束不满足 => 替换失败 => false. 用于容量约束的否定测试
+template <typename T, std::size_t C>
+concept ring_ok = requires { typename mpmc_ring<T, C>; };
+template <typename T, std::size_t C>
+concept deque_ok = requires { typename chase_lev_deque<T, C>; };
+
 TEST_SUITE("concurrent.detail") {
+
+    // 回归: 手写 (C & (C-1)) == 0 在 C == 0 时为真 -> 零容量曾放行,
+    // mask = -1 + 零长数组即 UB. has_single_bit 天然拒绝 0 与非两的幂
+    TEST_CASE("capacity_constraints_reject_zero_and_non_pow2") {
+        static_assert(!ring_ok<int*, 0>);
+        static_assert(!ring_ok<int*, 3>);
+        static_assert(ring_ok<int*, 1>); // 环允许 1(池级另由缺省/标签兜底)
+        static_assert(ring_ok<int*, 8>);
+
+        static_assert(!deque_ok<int*, 0>);
+        static_assert(!deque_ok<int*, 1>); // deque 还要求 >= 2
+        static_assert(!deque_ok<int*, 6>);
+        static_assert(deque_ok<int*, 2>);
+        static_assert(deque_ok<int*, 8>);
+    }
 
     // 校验回收到的指针集合恰好覆盖 storage 的每个元素一次
     bool exactly_once(const std::vector<int*>& got, const std::vector<int>& storage,

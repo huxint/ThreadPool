@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <new>
@@ -11,7 +12,7 @@ namespace concurrent::detail {
     /// Vyukov 有界 MPMC 环形队列. 槽类型为平凡可拷贝指针
     /// 快路径纯无锁; 满/空语义由调用方处理(try_push 返回 false, try_pop 返回 nullptr)
     template <typename T, std::size_t Capacity>
-        requires((Capacity & (Capacity - 1)) == 0 && std::is_trivially_copyable_v<T>)
+        requires(std::has_single_bit(Capacity) && std::is_trivially_copyable_v<T>)
     class mpmc_ring {
         static constexpr std::size_t mask = Capacity - 1;
 

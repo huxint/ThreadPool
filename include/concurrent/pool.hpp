@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -101,9 +102,9 @@ namespace concurrent {
         /// 无锁快路径占比, 不影响正确性; 缺省 256 / 1024
         static constexpr std::size_t LOCAL_CAP = detail::queue_local_cap_v<Flags...>;
         static constexpr std::size_t GLOBAL_CAP = detail::queue_global_cap_v<Flags...>;
-        static_assert(GLOBAL_CAP != 0 && (GLOBAL_CAP & (GLOBAL_CAP - 1)) == 0,
+        static_assert(std::has_single_bit(GLOBAL_CAP),
                       "queue_cap<Global, Local>: Global must be a nonzero power of two");
-        static_assert(LOCAL_CAP >= 2 && (LOCAL_CAP & (LOCAL_CAP - 1)) == 0,
+        static_assert(LOCAL_CAP >= 2 && std::has_single_bit(LOCAL_CAP),
                       "queue_cap<Global, Local>: Local must be a power of two >= 2");
         /// 每 worker 空闲节点缓存上限. 无上限时外部线程持续提交会让缓存长度
         /// 随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不来取)
