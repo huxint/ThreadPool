@@ -800,6 +800,58 @@ TEST_SUITE("concurrent.pool") {
         CHECK(done.load() == 100);
     }
 
+    // drain 放行 worker 内嵌套提交: 闸门挡住全部 worker, 树整体在
+    // stopping_ 之后展开 -> 每一次嵌套派生都走放行路径, 全部叶子须完成
+    TEST_CASE("shutdown_drain_completes_nested_fork_join_tree") {
+        pool p({.threads = 2});
+        tu::gate g;
+        g.block_all(p, 2);
+        tu::deadlock_watchdog wd(30s, "shutdown_drain_completes_nested_fork_join_tree");
+
+        std::atomic<int> leaves{0};
+        struct fork {
+            static void go(pool& p, int depth, std::atomic<int>& leaves) {
+                if (depth == 0) {
+                    leaves.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                static_cast<void>(
+                    p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); }));
+                static_cast<void>(
+                    p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); }));
+            }
+        };
+        fork::go(p, 10, leaves); // 根任务排队(未运行), 共 2^10 = 1024 叶
+
+        std::jthread shut([&p] { p.shutdown(shutdown_policy::drain); });
+        std::this_thread::sleep_for(5ms); // stopping_ 已置位而树仍被闸门挡着
+        g.release();                     // 整棵树在停止状态下派生并完成
+        shut.join();
+        CHECK(leaves.load() == 1024);
+    }
+
+    // 同一窗口内外部提交仍须被拒: 放行只属于 worker 内的嵌套派生
+    TEST_CASE("drain_rejects_external_but_allows_worker_nested") {
+        pool p({.threads = 1});
+        tu::gate g;
+        g.block_all(p, 1);
+        tu::deadlock_watchdog wd(30s, "drain_rejects_external_but_allows_worker_nested");
+
+        std::atomic<bool> nested_ok{false};
+        // root 排在闸门之后: 运行时池已处于 stopping 状态
+        static_cast<void>(p.execute([&p, &nested_ok]() noexcept {
+            nested_ok.store(p.execute([]() noexcept {}).has_value(),
+                            std::memory_order_relaxed);
+        }));
+
+        std::jthread shut([&p] { p.shutdown(shutdown_policy::drain); });
+        std::this_thread::sleep_for(5ms); // stopping_ 已置位, root 仍被闸门挡着
+        CHECK(!p.execute([]() noexcept {}).has_value()); // 外部提交被拒
+        g.release();
+        shut.join();
+        CHECK(nested_ok.load()); // worker 内嵌套提交被放行
+    }
+
     TEST_CASE("single_worker_preserves_fifo_order") {
         pool p({.threads = 1});
         std::vector<int> order;

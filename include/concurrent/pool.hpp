@@ -108,6 +108,11 @@ namespace concurrent {
         /// 每 worker 空闲节点缓存上限. 无上限时外部线程持续提交会让缓存长度
         /// 随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不来取)
         static constexpr std::size_t NODE_CACHE_CAP = 1024;
+        /// stopping_ 置位后 worker 嵌套提交的放行预算: 防"自适应派生"型任务
+        /// (派生速率不衰减)在关闭窗口内无限繁殖令 shutdown 永不返回.
+        /// 覆盖约 depth-21 满二叉树的派生量, 耗尽退回拒绝(stopped);
+        /// 正常运行零触碰
+        static constexpr std::int64_t DRAIN_NESTED_BUDGET = 4'000'000;
         static constexpr int PAUSE_BATCH = 16; ///< 每轮探测间的让核步长
 
         using node_t = detail::task_node;
@@ -397,7 +402,9 @@ namespace concurrent {
 
         /// 关闭. drain: 排空后退出(默认); discard: 丢弃未开始的任务立即退出
         /// 运行中任务两种策略下都会等待完成(jthread join 的固有语义), discard
-        /// 仅跳过排队任务的执行. 可并发调用: 首个调用者的 policy 生效, 其余
+        /// 仅跳过排队任务的执行. drain 期间正在运行任务在 worker 内的嵌套
+        /// 派生被放行(有限预算, 见 DRAIN_NESTED_BUDGET), 在途计算树得以
+        /// 整体完成而非中途断链. 可并发调用: 首个调用者的 policy 生效, 其余
         /// 调用者阻塞至拆除完成后做一次空收敛
         void shutdown(shutdown_policy policy = shutdown_policy::drain) noexcept {
             // seq_cst: 与 enqueue 侧的 Dekker 配对另一半, 保证"在途登记先于
@@ -622,21 +629,36 @@ namespace concurrent {
             // 乐观预检: 已停则直接拒绝, 不触碰任何计数. 若被拒提交也抬高
             // pending_, 持续重试的生产者会把 drop_all_queued 的收敛条件
             // 无限重置 - 生产者等 shutdown 返回, shutdown 等生产者停手
+            //
+            // 唯一例外: 本池 worker 的嵌套提交放行(有限预算). 正在运行的
+            // fork-join 型任务在 shutdown 期间派生子任务, 语义上属于
+            // "停机前已接受工作"的延续, 拒绝它会让 drain 变相丢弃在途
+            // 计算树; 放行不登记 submitting_: 嵌套提交的父任务持有
+            // pending_ 计数直至派生返回, wait/drop 的收敛判据不可能
+            // 越过它静默(见 nested_submit_permitted)
+            bool registered = false;
             if (stopping_.load(std::memory_order_acquire)) [[unlikely]] {
-                // 统一出口 abandon: submit 路径节点入队前已挂 discard 钩子,
-                // 须以取消语义终结其共享状态; execute 路径节点无钩子, 等价销毁
-                abandon(node);
-                return std::unexpected(submit_error::stopped);
-            }
-            // Dekker 配对(两侧皆 seq_cst): 在途登记先于复查. 若复查仍未
-            // 见置位, 依全序"登记 < 复查 < 置位 < 收敛轮读", 轮次必能读到
-            // submitting_ > 0 而继续等待, "越过检查却在途"的提交不会被漏
-            // 计; 反之复查见置位则撤销登记走拒绝路径, 不留痕迹
-            submitting_.fetch_add(1, std::memory_order_seq_cst);
-            if (stopping_.load(std::memory_order_seq_cst)) [[unlikely]] {
-                submitting_.fetch_sub(1, std::memory_order_seq_cst);
-                abandon(node);
-                return std::unexpected(submit_error::stopped);
+                if (!nested_submit_permitted()) [[unlikely]] {
+                    // 统一出口 abandon: submit 路径节点入队前已挂 discard 钩子,
+                    // 须以取消语义终结其共享状态; execute 路径节点无钩子, 等价销毁
+                    abandon(node);
+                    return std::unexpected(submit_error::stopped);
+                }
+            } else {
+                // Dekker 配对(两侧皆 seq_cst): 在途登记先于复查. 若复查仍未
+                // 见置位, 依全序"登记 < 复查 < 置位 < 收敛轮读", 轮次必能读到
+                // submitting_ > 0 而继续等待, "越过检查却在途"的提交不会被漏
+                // 计; 反之复查见置位则撤销登记, 走拒绝或嵌套放行, 不留痕迹
+                submitting_.fetch_add(1, std::memory_order_seq_cst);
+                if (stopping_.load(std::memory_order_seq_cst)) [[unlikely]] {
+                    submitting_.fetch_sub(1, std::memory_order_seq_cst);
+                    if (!nested_submit_permitted()) [[unlikely]] {
+                        abandon(node);
+                        return std::unexpected(submit_error::stopped);
+                    }
+                } else {
+                    registered = true;
+                }
             }
             // pending_ 只计已入队/运行中的工作: wait() 与 drain 的计数语义
             // 自此与"正在尝试提交"解耦
@@ -645,13 +667,30 @@ namespace concurrent {
             // worker 内嵌套提交: 优先本地 deque(LIFO 缓存热度)
             if (detail::tls_pool == this && ctxs_[detail::tls_worker].local[level].push(node))
                 [[likely]] {
-                submitting_.fetch_sub(1, std::memory_order_seq_cst);
+                if (registered) {
+                    submitting_.fetch_sub(1, std::memory_order_seq_cst);
+                }
                 return {};
             }
             // 外部提交或本地溢出: 全局队列(环满自动落入溢出链, 永不失败, 永不阻塞)
             (*globals_)[level].push(node);
-            submitting_.fetch_sub(1, std::memory_order_seq_cst);
+            if (registered) {
+                submitting_.fetch_sub(1, std::memory_order_seq_cst);
+            }
             return {};
+        }
+
+        /// stopping_ 置位后本条提交是否放行: 仅本池 worker 的嵌套提交,
+        /// 消耗有限预算(DRAIN_NESTED_BUDGET), 其余一律拒绝.
+        /// 放行依赖的不变式: 调用方(worker)必在执行某个任务体, 而任务体
+        /// 在完成前持有 pending_ 计数 -> 收敛判据(pending 归零)不可能
+        /// 在派生窗口内静默成立, 在途子节点必被计入或被后续轮次消费
+        [[nodiscard]]
+        bool nested_submit_permitted() noexcept {
+            if (detail::tls_pool != static_cast<const void*>(this)) {
+                return false;
+            }
+            return drain_nested_budget_.fetch_sub(1, std::memory_order_relaxed) > 0;
         }
 
         /// 入队并唤醒一个 worker
@@ -973,6 +1012,9 @@ namespace concurrent {
 
         /// 仅拆除路径使用; 与热路径原子量无共享行
         std::mutex shutdown_mtx_;
+        /// drain 期嵌套提交放行余额(见 DRAIN_NESTED_BUDGET), 仅 stopping_
+        /// 置位后触碰
+        std::atomic<std::int64_t> drain_nested_budget_{DRAIN_NESTED_BUDGET};
 
         std::unique_ptr<worker_ctx_t[]> ctxs_;
         std::conditional_t<WORKER_CAP != 0, std::inplace_vector<std::jthread, WORKER_CAP>,
