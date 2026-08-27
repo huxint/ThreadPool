@@ -47,15 +47,6 @@ namespace concurrent::detail {
             return &vt;
         }
 
-        static constexpr const vtable* tag(bool inplace, const vtable* v) noexcept {
-            return reinterpret_cast<const vtable*>(reinterpret_cast<std::uintptr_t>(v) |
-                                                   (inplace ? 1u : 0u));
-        }
-        static const vtable* untag(const vtable* v) noexcept {
-            return reinterpret_cast<const vtable*>(reinterpret_cast<std::uintptr_t>(v) &
-                                                   ~std::uintptr_t{1});
-        }
-
     public:
         using result_type = R;
 
@@ -69,23 +60,23 @@ namespace concurrent::detail {
             using FD = std::decay_t<F>;
             if constexpr (sizeof(FD) <= SboBytes && alignof(FD) <= alignof(std::max_align_t)) {
                 ::new (static_cast<void*>(storage_)) FD(std::forward<F>(f));
-                vt_ = tag(true, inplace_vt<FD>());
+                vt_ = inplace_vt<FD>();
             } else {
                 FD* p = new FD(std::forward<F>(f)); // bad_alloc 仅在提交边界被捕获
                 ::new (static_cast<void*>(storage_)) FD*(p);
-                vt_ = tag(false, heap_vt<FD>());
+                vt_ = heap_vt<FD>();
             }
         }
 
         ~sbo_function() {
             if (vt_) {
-                untag(vt_)->destroy(storage_);
+                vt_->destroy(storage_);
             }
         }
 
         sbo_function(sbo_function&& other) noexcept : vt_(other.vt_) {
             if (vt_) {
-                untag(vt_)->move(storage_, other.storage_);
+                vt_->move(storage_, other.storage_);
                 other.vt_ = nullptr;
             }
         }
@@ -93,10 +84,10 @@ namespace concurrent::detail {
         sbo_function& operator=(sbo_function&& other) noexcept {
             if (this != &other) {
                 if (vt_) {
-                    untag(vt_)->destroy(storage_);
+                    vt_->destroy(storage_);
                 }
                 if ((vt_ = other.vt_)) {
-                    untag(vt_)->move(storage_, other.storage_);
+                    vt_->move(storage_, other.storage_);
                     other.vt_ = nullptr;
                 }
             }
@@ -111,11 +102,11 @@ namespace concurrent::detail {
             return vt_ != nullptr;
         }
 
-        R operator()() { return untag(vt_)->invoke(storage_); }
+        R operator()() { return vt_->invoke(storage_); }
 
         void reset() noexcept {
             if (vt_) {
-                untag(vt_)->destroy(storage_);
+                vt_->destroy(storage_);
                 vt_ = nullptr;
             }
         }
