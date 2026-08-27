@@ -572,7 +572,9 @@ namespace concurrent {
         std::expected<void, submit_error> enqueue(int level, node_t* node) noexcept {
             pending_.fetch_add(1, std::memory_order_acq_rel);
             if (stopping_.load(std::memory_order_acquire)) [[unlikely]] {
-                destroy_node(node);
+                // 统一出口 abandon: submit 路径节点入队前已挂 discard 钩子,
+                // 须以取消语义终结其共享状态; execute 路径节点无钩子, 等价销毁
+                abandon(node);
                 // 必须与其余完成路径一样推进空闲代际: 若在此裸减计数, 恰好
                 // 挂在 idle_gen_ 上的 shutdown(drain) 将永远等不到唤醒 -
                 // 本次递减可能正是把 pending 归零的那一次
@@ -646,14 +648,16 @@ namespace concurrent {
             return new (std::nothrow) node_t{};
         }
 
-        /// 提交失败路径的销毁: 节点尚未入队, 直接归还给分配器
+        /// abandon 的实现细节: 抹掉 body 后归还分配器. 不允许被直接调用 -
+        /// 节点可能挂着 discard 钩子, 绕过 abandon 即共享状态永不终结
         void destroy_node(node_t* n) noexcept {
             n->body.reset();
             delete n;
         }
 
-        /// 收尾从未入队的节点: 先以取消语义终结其共享状态(若有)再销毁,
-        /// 使持有句柄的一方经错误通道观测 operation_cancelled 而非永久等待
+        /// 节点回收的统一出口: 未执行过的节点挂着 discard 钩子, 先以取消
+        /// 语义终结其共享状态(使等待方经错误通道观测 operation_cancelled
+        /// 而非永久等待)再销毁; 已执行的节点钩子已被清除, 等价于直接销毁
         void abandon(node_t* n) noexcept {
             if (n->discard) {
                 n->discard(n->discard_ctx);
@@ -832,7 +836,7 @@ namespace concurrent {
         void flush_freelists() noexcept {
             for (std::size_t i = 0; i < n_threads_; ++i) {
                 while (auto* n = ctxs_[i].cache.pop()) {
-                    destroy_node(n);
+                    abandon(n); // 缓存节点钩子已清, 经统一出口仅为结构一致
                 }
             }
         }
