@@ -32,7 +32,10 @@ export namespace concurrent {
 
     // ---- 惰性批量 ----
     using concurrent::parallel_for;
+    using concurrent::parallel_for_chunked;
     using concurrent::parallel_map;
+    using concurrent::parallel_map_chunked;
+    using concurrent::parallel_view;
 
     // ---- 特性标签 ----
     using concurrent::cancellable;

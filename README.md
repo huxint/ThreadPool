@@ -17,42 +17,42 @@ C++26 高性能线程池: 工作窃取调度 + 无锁队列 + 函数式任务组
 
 | 场景 | Taskflow | BS::thread_pool | 本库 | vs 最优基线 |
 |------|---------:|----------------:|-----:|------------:|
-| fire-and-forget 单生产者 | 0.14 | 0.16 | **1.96** | **12.2x** |
-| submit + 取回结果 | 0.04 | 0.03 | **0.72** | **20.2x** |
-| 递归 fork-join(深度 18) | **4.81** | 0.68 | 3.96 | 0.82x |
-| 多生产者竞争 x2 | **3.15** | 0.07 | 2.77 | 0.88x |
-| 多生产者竞争 x4 | **4.01** | 0.36 | 3.08 | 0.77x |
-| 多生产者竞争 x8 | **2.50** | 1.13 | 1.51 | 0.60x |
+| fire-and-forget 单生产者 | 0.09 | 0.04 | **0.56** | **6.2x** |
+| submit + 取回结果 | 0.04 | 0.03 | **0.77** | **21.4x** |
+| 递归 fork-join(深度 18) | 4.83 | 0.69 | **5.63** | **1.17x** |
+| 多生产者竞争 x2 | 2.69 | 0.03 | **2.71** | **1.01x** |
+| 多生产者竞争 x4 | **3.46** | 0.42 | 1.99 | 0.57x |
+| 多生产者竞争 x8 | **2.50** | 1.07 | 1.20 | 0.48x |
 
 延迟(空池 提交 -> 取回 往返, 微秒, 越小越好):
 
 | 分位 | Taskflow | BS::thread_pool | 本库 |
 |------|---------:|----------------:|-----:|
-| P50 | 29.75 | 31.62 | **1.04** |
-| P90 | 35.21 | 37.54 | **1.91** |
-| P99 | 76.90 | 97.14 | **27.98** |
+| P50 | 32.67 | 33.47 | **1.04** |
+| P90 | 40.87 | 42.76 | **1.80** |
+| P99 | 78.16 | 90.88 | **17.26** |
 
 其他负载:
 
 | 场景(越小越好) | Taskflow | BS::thread_pool | 本库 |
 |------|---------:|----------------:|-----:|
-| 混合负载: 90% 短任务 + 10% 长任务(ms) | 52.05 | 33.54 | **11.01** |
-| 扩展性: 固定实算 x 8 线程(ms) | 2.87 | **2.87** | 2.89 |
+| 混合负载: 90% 短任务 + 10% 长任务(ms) | 110.72 | 77.43 | **12.59** |
+| 扩展性: 固定实算 x 8 线程(ms) | 3.07 | **5.24** | 3.06 |
 
 特性组合吞吐(execute 单生产者): 各特性标签单独开启及全开时的相对吞吐:
 
 | 标签组合 | 吞吐(M/s) | 相对无标签 |
 |----------|--------:|-----------:|
-| 无标签 | 2.47 | 1.00x |
-| + priority | 2.64 | 1.07x |
-| + cancellable | 2.72 | 1.10x |
-| + trace 未设钩子 | 2.84 | 1.15x |
-| + trace on_end 空钩子 | 2.66 | 1.08x |
-| + worker_cap&lt;8&gt; | 2.60 | 1.05x |
-| 全部组合 | 2.53 | 1.02x |
+| 无标签 | 0.51 | 1.00x |
+| + priority | 0.47 | 0.91x |
+| + cancellable | 0.48 | 0.95x |
+| + trace 未设钩子 | 0.45 | 0.87x |
+| + trace on_end 空钩子 | 0.57 | 1.11x |
+| + worker_cap&lt;8&gt; | 0.52 | 1.01x |
+| 全部组合 | 0.58 | 1.14x |
 
-> 参考环境: GCC 16.2, 16 硬件线程, 基准线程数 8. 数值随时段波动, `./build/concurrent_bench [--quick]` 复现
-> 延迟优势的关键设计: worker 睡眠前执行时间预算型有界自旋(默认 64us), 吸收成簇到达的任务, 免去 futex 内核往返
+> 参考环境: GCC 16.2, 16 硬件线程, 基准线程数 8. 数值随时段波动(同机三方同步波动, 相对倍数稳定), `./build/concurrent_bench [--quick]` 复现
+> 延迟优势的关键设计: worker 睡眠前执行时间预算型有界自旋(默认 64µs, `options::spin_budget` 可调), 吸收成簇到达的任务, 免去 futex 内核往返
 
 ## 功能一览
 
@@ -60,9 +60,11 @@ C++26 高性能线程池: 工作窃取调度 + 无锁队列 + 函数式任务组
 |------|------|
 | 工作窃取调度 | 每线程本地 deque(LIFO) + Chase-Lev 窃取(FIFO); 全局侧 Vyukov MPMC 环 + 保序溢出链兜底, 提交永不阻塞, 永不拒绝 |
 | 零 throw 契约 | 提交失败经 `std::expected` 报告; 任务体异常透传至结果通道; `execute` 编译期强制 `noexcept` |
-| 函数式组合子 | `task` 支持 `map` / `and_then` / `inspect`, `when_all` 汇合多任务为 `task<tuple<...>>` |
-| 惰性批量 | `parallel_map` / `parallel_for` 返回轻量视图, 首次迭代整批入队, 按输入顺序取回 `expected` |
-| 可组合特性标签 | `priority`, `cancellable`, `trace`, `worker_cap<N>` 变参无序组合, 编译期开关零抽象税 |
+| 函数式组合子 | `task` 支持 `map` / `and_then` / `inspect`, `when_all` 汇合多任务为 `task<tuple<...>>`; 续延链深度守卫, 万级链不爆栈 |
+| 惰性批量 | `parallel_map` / `parallel_for` 返回轻量视图, 首次迭代整批入队, 按输入顺序取回 `expected`; 迭代面经 `std::generator`, `results()` 可直接组合 ranges 管道 |
+| 分块批量 | `parallel_map_chunked` / `parallel_for_chunked` 每块一任务, 摊薄元素级调度开销, 缓解大区间整批提交的内存尖峰 |
+| P2300 scheduler | 可选对接 [stdexec](https://github.com/NVIDIA/stdexec): `ex::as_scheduler(pool)` 暴露标准 sender/receiver 算法组合(构建开关, 核心库零依赖) |
+| 可组合特性标签 | `priority`, `cancellable`, `trace`, `worker_cap<N>`, `queue_cap<Global, Local>` 变参无序组合, 编译期开关零抽象税 |
 | 协作取消 | 任务可接收 `std::stop_token`; 未开跑即取消的任务体被跳过并以 `operation_cancelled` 标记 |
 
 ## 调度架构
@@ -139,11 +141,13 @@ task 组合子(均在完成任务的工作线程上内联执行, 结果值恰好
 | 接口 | 行为 |
 |------|------|
 | `parallel_map(p, range, f)` | 惰性视图: 不迭代则不提交; `begin()` 整批入队, 按输入顺序阻塞取回 `expected`; 析构等待全部完成 |
+| `parallel_map_chunked(p, range, f, grain)` | 分块版: 每 grain 个元素一块(0 = 按线程数), `f` 对每块调用一次并接收子区间; 大区间优先用此入口 |
 | `parallel_for(p, range, f).run()` | 同上, 无返回值版; `.run()` 直接执行并返回首个错误 |
+| `parallel_view::results()` | 结果流: 单趟 `std::generator`, 可直接组合 ranges 管道(如 `v.results() \| std::views::take(3)`) |
 | `p.wait()` / `wait_for` / `wait_until` | 阻塞至全部完成 / 超时变体 |
-| `p.shutdown(policy)` | `drain` 排空后退出(析构默认); `discard` 丢弃排队任务并以取消语义终结其结果通道; 运行中任务两者都会等待完成(join 固有语义) |
+| `p.shutdown(policy)` | `drain` 排空后退出(析构默认); `discard` 丢弃排队任务并以取消语义终结其结果通道; 运行中任务两者都会等待完成(join 固有语义); 两者均放行 worker 内嵌套提交(fork-join 析构安全) |
 
-错误辨识: `is_cancelled(e)` 判取消, `submit_error_of(e)` 还原提交阶段失败
+错误辨识: `is_cancelled(e)` 判取消, `is_invalid_task(e)` 判无效任务句柄, `submit_error_of(e)` 还原提交阶段失败
 
 ## 特性标签
 
@@ -155,6 +159,15 @@ task 组合子(均在完成任务的工作线程上内联执行, 结果值恰好
 | `cancellable` | 解锁返回 `stop_source` 的 execute 重载 |
 | `trace` | 运行期钩子 `on_enqueue` / `on_begin` / `on_end`(签名强制 `noexcept`), 事件含 id/phase/outcome/priority/worker |
 | `worker_cap<N>` | workers 以 `inplace_vector<jthread, N>` 静态存储, 无标签用 `vector` |
+| `queue_cap<Global, Local>` | 全局环 / 本地 deque 容量(2 的幂, 缺省 1024 / 256). 环满自动落入保序溢出链, 容量只影响内存占用与无锁快路径占比 |
+
+运行期配置 `pool::options`:
+
+| 字段 | 说明 |
+|------|------|
+| `threads` | worker 数, 0 = `hardware_concurrency()` |
+| `spin_budget` | 睡前有界自旋时间预算(默认 64µs, 0 = 不自旋直接睡). 任务到达间隔稳定小于该值时 N 个 worker 全程占核, 稀疏流量的服务型池宜调小 |
+| `hooks` | trace 钩子(仅 `trace` 标签下生效) |
 
 ## 构建
 
@@ -173,10 +186,27 @@ ctest --test-dir build          # 测试
 |------|------|
 | `-DBUILD_MODULE=ON` | 模块封装 `concurrent.pool`(需 Ninja) |
 | `-DSANITIZER=address\|thread` | 叠加 UBSan 的消毒器构建 |
+| `-DWITH_STDEXEC=ON -DSTDEXEC_ROOT=<path>` | P2300 scheduler 集成测试(独立目标; path 为含 `stdexec/` 的包含根) |
 
 契约(Contracts)在 Debug 下 enforce, 其余配置 ignore(零开销). 配置即生成 `compile_commands.json` 并软链到仓库根目录
 
 模块封装: `-DBUILD_MODULE=ON` 构建后即可 `import concurrent.pool;`. 注意标准库文本包含须置于 `import` 之前(GCC 16 工具链限制), 完整示例见 `module/smoke.cpp`
+
+### stdexec(P2300)可选面
+
+核心库零依赖; 需要 sender/receiver 生态(`then` / `when_all` / `split` / 标准算法)时:
+
+```cpp
+#include <concurrent/execution.hpp>   // 提供 stdexec 的 TU 须先自行引入该库
+
+concurrent::pool p({.threads = 4});
+auto sched = concurrent::ex::as_scheduler(p);
+
+using namespace stdexec;
+auto [v] = sync_wait(sched.schedule() | then([] { return 42; })).value();
+```
+
+池已关闭时 `schedule` 以 `set_stopped` 完成; 续延异常经 `set_error` 送达(`sync_wait` 按 P2300 约定重抛, 与本库组合子的 `expected` 通道不同). 组合子(`map` / `and_then` / `when_all`)是零依赖路径的唯一选择, 两套面并存各取所长
 
 ## 测试
 
@@ -197,7 +227,8 @@ TSan 抑制清单 `tests/tsan.supp` 由 CTest 自动挂载, 仅滤除 libubsan/l
 include/concurrent/          公共头文件(header-only 主交付)
   pool.hpp                   basic_pool<Flags...> 与生命周期
   task.hpp                   task<T>, 共享状态与组合子续延
-  parallel.hpp               惰性批量视图
+  parallel.hpp               惰性批量视图与分块入口
+  execution.hpp              stdexec (P2300) scheduler 适配(可选依赖)
   tags.hpp / trace.hpp       特性标签与调试钩子
   detail/                    chase_lev / global_queue / mpmc_ring / sbo_function / spinlock
 module/concurrent.cppm       模块封装(concurrent.pool)
