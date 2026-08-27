@@ -26,7 +26,7 @@ namespace concurrent {
         struct queue_cap_flag {};
 
         /// queue_cap 标签的缺省容量
-        inline constexpr std::size_t queue_cap_default_global = 1024;
+        inline constexpr std::size_t queue_cap_default_global = 65536;
         inline constexpr std::size_t queue_cap_default_local = 256;
     } // namespace detail
 
