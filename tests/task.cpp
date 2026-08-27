@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <vector>
 
 using namespace concurrent;
 using namespace std::chrono_literals;
@@ -328,5 +329,89 @@ TEST_SUITE("concurrent.task") {
             sum += c.get().value_or(0);
         }
         CHECK(sum == static_cast<long>(n) * (n - 1)); // 2 * n(n-1)/2
+    }
+
+    // 结果值生命周期: 共享状态的 value_ 是裸字节缓冲, 未被消费时必须由状态析构收尾
+
+    TEST_CASE("unconsumed_result_value_is_destroyed") {
+        const int base = tu::tracked::live.load();
+        {
+            pool p({.threads = 2});
+            auto t = p.submit([] { return tu::tracked{7}; });
+            REQUIRE(t.has_value());
+            t->wait(); // 只等完成, 从不 get(): 值就此留在共享状态里
+            p.wait();
+        }
+        CHECK(tu::tracked::live.load() == base);
+    }
+
+    TEST_CASE("dropped_task_handle_destroys_result") {
+        const int base = tu::tracked::live.load();
+        {
+            pool p({.threads = 2});
+            std::vector<task<tu::tracked>> handles;
+            for (int i = 0; i < 64; ++i) {
+                auto t = p.submit([i] { return tu::tracked{i}; });
+                REQUIRE(t.has_value());
+                handles.push_back(std::move(*t));
+            }
+            p.wait();
+            handles.clear(); // 一个都不 get, 直接丢弃全部句柄
+        }
+        CHECK(tu::tracked::live.load() == base);
+    }
+
+    TEST_CASE("unconsumed_when_all_tuple_is_destroyed") {
+        const int base = tu::tracked::live.load();
+        {
+            pool p({.threads = 2});
+            auto a = p.submit([] { return tu::tracked{1}; });
+            auto b = p.submit([] { return tu::tracked{2}; });
+            REQUIRE(a.has_value());
+            REQUIRE(b.has_value());
+            auto joined = when_all(std::move(*a), std::move(*b));
+            joined.wait(); // tuple 已装配进共享状态, 但从不取走
+            p.wait();
+        }
+        CHECK(tu::tracked::live.load() == base);
+    }
+
+    TEST_CASE("unconsumed_map_intermediate_is_destroyed") {
+        const int base = tu::tracked::live.load();
+        {
+            pool p({.threads = 2});
+            auto t = p.submit([] { return tu::tracked{3}; });
+            REQUIRE(t.has_value());
+            auto mapped = t->map([](tu::tracked&& x) { return tu::tracked{x.v * 2}; });
+            mapped.wait(); // 父任务的值已被续延取走, 子任务的值无人认领
+            p.wait();
+        }
+        CHECK(tu::tracked::live.load() == base);
+    }
+
+    TEST_CASE("copy_only_result_leaves_no_residue") {
+        // 只可拷贝的类型: 取值路径拿到的是拷贝, 缓冲区里的源对象必须被析构
+        const int base = tu::copy_only::live.load();
+        {
+            pool p({.threads = 2});
+            auto t = p.submit([] { return tu::copy_only{5}; });
+            REQUIRE(t.has_value());
+            auto r = t->get();
+            REQUIRE(r.has_value());
+            CHECK(r->v == 5);
+        }
+        CHECK(tu::copy_only::live.load() == base);
+    }
+
+    TEST_CASE("copy_only_unconsumed_result_is_destroyed") {
+        const int base = tu::copy_only::live.load();
+        {
+            pool p({.threads = 2});
+            auto t = p.submit([] { return tu::copy_only{9}; });
+            REQUIRE(t.has_value());
+            t->wait();
+            p.wait();
+        }
+        CHECK(tu::copy_only::live.load() == base);
     }
 }

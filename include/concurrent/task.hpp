@@ -132,6 +132,21 @@ namespace concurrent {
             std::uint64_t id = 0;      ///< trace 任务编号
             std::stop_source source{}; ///< 取消源; 非取消提交时不可触发
 
+            /// value_ 是裸字节缓冲, 不会自行调用 T 的析构函数. 结果值未被取走
+            /// 就析构本状态时(只 wait 不 get / 丢弃组合子中间态 / 只迭代半个
+            /// parallel_view), 若不在此收尾则 T 的析构函数永不执行
+            ~shared_state() {
+                if constexpr (!std::is_void_v<T>) {
+                    if (has_value_) {
+                        std::destroy_at(std::launder(reinterpret_cast<T*>(&value_)));
+                    }
+                }
+            }
+
+            shared_state() = default;
+            shared_state(const shared_state&) = delete ("task states are shared, never copied");
+            shared_state& operator=(const shared_state&) = delete ("task states are never copied");
+
             /// 完成路径(任务体外壳恰好调用一次)
             void finish() noexcept {
                 cont_node* list;
@@ -173,14 +188,22 @@ namespace concurrent {
                 has_value_ = true;
             }
 
-            /// 移动取值(恰好一次; 外壳保证调用次序). 成员模板延迟实例化, 避免 T=void 时形成
+            /// 取走值(恰好一次; 外壳保证调用次序). 成员模板延迟实例化, 避免 T=void 时形成
             /// void&
+            ///
+            /// 按值返回而非 T&&: 只有这样才能在调用方消费完之后销毁缓冲区里的源对象.
+            /// 移动后的残壳仍可能持有资源, 而只可拷贝的 T 更是整个对象都留在原处 -
+            /// 二者都必须析构. 代价是续延跳转多一次 T 的移动(get() 路径不变, 原本
+            /// 也是两次移动)
             template <typename U = T>
                 requires(!std::is_void_v<U>)
             [[nodiscard]]
-            U&& take_value_unchecked() noexcept {
+            U take_value_unchecked() noexcept(std::is_nothrow_move_constructible_v<U>) {
+                U* p = std::launder(reinterpret_cast<U*>(&value_));
+                U out{std::move(*p)}; // 抛出则 has_value_ 仍为真, 交由析构函数收尾
+                std::destroy_at(p);
                 has_value_ = false;
-                return std::move(*std::launder(reinterpret_cast<U*>(&value_)));
+                return out;
             }
 
             /// 非消耗性观察(inspect 用). 成员模板延迟实例化, 避免 T=void 时形成 void&
@@ -226,8 +249,7 @@ namespace concurrent {
                     if (!has_value_) {
                         return std::unexpected(invalid_task_error);
                     }
-                    T out{take_value_unchecked()};
-                    return out;
+                    return take_value_unchecked();
                 } else {
                     return {};
                 }
@@ -394,10 +416,16 @@ namespace concurrent {
                 ::new (static_cast<void*>(buf)) T(std::move(v));
                 live = true;
             }
+            /// 按值返回并销毁源对象: 与 shared_state::take_value_unchecked 同理,
+            /// 若只把值移走而把残壳留在 buf 里(且 live 已置假), 析构函数就再也
+            /// 收不到它
             [[nodiscard]]
-            T&& take() noexcept {
+            T take() noexcept(std::is_nothrow_move_constructible_v<T>) {
+                T* p = value();
+                T out{std::move(*p)};
+                std::destroy_at(p);
                 live = false;
-                return std::move(*std::launder(reinterpret_cast<T*>(buf)));
+                return out;
             }
 
         private:

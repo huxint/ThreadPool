@@ -404,4 +404,27 @@ TEST_SUITE("concurrent.parallel") {
         REQUIRE(outer.has_value());
         CHECK(outer->get().value_or(-1) == 500L);
     }
+
+    TEST_CASE("partially_iterated_view_destroys_remaining_results") {
+        // 只消费前几个结果就析构视图: 余下已完成任务的结果值仍须被析构
+        const int base = tu::tracked::live.load();
+        {
+            pool p({.threads = 4});
+            std::vector<int> data(64);
+            std::iota(data.begin(), data.end(), 0);
+
+            auto v = parallel_map(p, data, [](int x) { return tu::tracked{x}; });
+            int seen = 0;
+            for (auto&& r : v) {
+                if (r) {
+                    ++seen;
+                }
+                if (seen == 4) {
+                    break; // 提前跳出, 其余 60 个结果无人认领
+                }
+            }
+            CHECK(seen == 4);
+        }
+        CHECK(tu::tracked::live.load() == base);
+    }
 }
