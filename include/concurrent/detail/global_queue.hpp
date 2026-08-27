@@ -109,14 +109,19 @@ namespace concurrent::detail {
             first->next_q = nullptr;
             std::size_t removed = 1;
 
-            // 回填: 让后续 pop 回到无锁环上; 批量上限保证临界区常数时间
+            // 回填: 让后续 pop 回到无锁环上; 批量上限保证临界区常数时间.
+            // 必须先断链再发布: try_push 一旦成功, 节点立即对其他消费者可见,
+            // 随时可能被取走执行并回收(缓存满时直接归还分配器), 此后本线程
+            // 不得再触碰它; 未发布成功则链指针原样恢复, 链保持完整
             for (std::size_t i = 0; i < REFILL_BATCH && head_; ++i) {
                 Node* n = head_;
+                Node* next = n->next_q;
+                n->next_q = nullptr;
                 if (!ring_.try_push(n)) { // 环又满了(生产者正猛灌), 留在链上
+                    n->next_q = next;
                     break;
                 }
-                head_ = n->next_q;
-                n->next_q = nullptr;
+                head_ = next;
                 ++removed;
             }
             if (!head_) {
