@@ -241,8 +241,42 @@ TEST_SUITE("concurrent.pool") {
         CHECK(is_cancelled(r.error()));
     }
 
-    TEST_CASE("shutdown_idempotent") {
-        pool p({.threads = 2});
+    // 回归: 节点回收后 discard 钩子必须清除. 钩子只服务于"从未执行"的节点,
+    // 而 execute 路径复用节点时不覆写该字段 -> 陈旧钩子会指向早已释放的共享
+    // 状态, 关闭丢弃时 abandon 便在其上写入(ASan 实测 heap-use-after-free)
+    TEST_CASE("recycled_node_drops_stale_discard_hook") {
+        pool p({.threads = 1});
+
+        // submit 型任务: 节点带 discard 钩子, 指向其共享状态
+        {
+            auto t = p.submit([] { return std::string("payload"); });
+            REQUIRE(t.has_value());
+            CHECK(t->get().value_or(std::string{}) == std::string("payload"));
+        } // 句柄销毁 -> 共享状态释放; 节点回到 worker0 的空闲链
+
+        std::atomic<bool> queued{false};
+        std::atomic<bool> release{false};
+        static_cast<void>(p.execute([&p, &queued, &release]() noexcept {
+            // 在 worker 线程上嵌套提交 -> 取回上面那个节点
+            for (int i = 0; i < 8; ++i) {
+                static_cast<void>(p.execute([]() noexcept {}));
+            }
+            queued.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire)) {
+                std::this_thread::yield(); // 卡住唯一 worker, 嵌套任务滞留队列
+            }
+        }));
+
+        while (!queued.load(std::memory_order_acquire)) {
+        }
+        std::jthread killer([&p] { p.shutdown(shutdown_policy::discard); });
+        std::this_thread::sleep_for(20ms); // 让 drop_all_queued 撞上那些节点
+        release.store(true, std::memory_order_release);
+        killer.join();
+        CHECK(!p.running());
+    }
+
+    TEST_CASE("shutdown_idempotent") {        pool p({.threads = 2});
         static_cast<void>(p.execute([]() noexcept {}));
         p.shutdown();
         p.shutdown(shutdown_policy::discard);

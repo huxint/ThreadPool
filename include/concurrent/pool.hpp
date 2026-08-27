@@ -635,6 +635,12 @@ namespace concurrent {
         void execute_node(node_t* n, std::size_t worker) noexcept {
             n->body();
             n->body.reset();
+            // 丢弃钩子只服务于"从未执行"的节点. 一旦执行完毕, 它指向的共享
+            // 状态随时可能被释放(body 析构即放掉最后一份引用), 故必须与 body
+            // 一同清除: execute 路径复用节点时不覆写这两个字段, 陈旧钩子会被
+            // 带进队列, 关闭丢弃时 abandon 便在已释放的状态上写入
+            n->discard = nullptr;
+            n->discard_ctx = nullptr;
             detail::freelist_push(ctxs_[worker].free_head, n);
         }
 
