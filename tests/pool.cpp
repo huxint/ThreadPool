@@ -360,6 +360,27 @@ TEST_SUITE("concurrent.pool") {
         CHECK(completed == rounds);
     }
 
+    // 回归(E0 活锁): 只要任何线程还在持续尝试提交(哪怕全部被拒),
+    // shutdown(drain) 就必须仍能返回. 修复前被拒提交会瞬时抬高 pending_,
+    // 收敛条件被无限重置, 生产者与 shutdown 互等
+    TEST_CASE("shutdown_returns_while_producers_keep_retrying") {
+        tu::deadlock_watchdog wd{30s, "shutdown_returns_while_producers_keep_retrying"};
+        pool p({.threads = 2});
+        std::atomic<bool> stop{false};
+        std::jthread prod{[&] {
+            while (!stop.load(std::memory_order_acquire)) {
+                static_cast<void>(p.execute([]() noexcept {})); // 被拒也继续重试
+            }
+        }};
+        std::this_thread::sleep_for(2ms); // 让重试流稳定运转
+
+        p.shutdown(shutdown_policy::drain); // 返回即证明活锁已消除
+
+        stop.store(true, std::memory_order_release);
+        prod.join();
+        CHECK(!p.running());
+    }
+
     TEST_CASE("wait_for_timeout_and_completion") {
         pool p({.threads = 1});
         tu::gate g;

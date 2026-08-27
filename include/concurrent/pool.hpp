@@ -381,7 +381,9 @@ namespace concurrent {
         /// 仅跳过排队任务的执行. 可并发调用: 首个调用者的 policy 生效, 其余
         /// 调用者阻塞至拆除完成后做一次空收敛
         void shutdown(shutdown_policy policy = shutdown_policy::drain) noexcept {
-            const bool first = !stopping_.exchange(true, std::memory_order_acq_rel);
+            // seq_cst: 与 enqueue 侧的 Dekker 配对另一半, 保证"在途登记先于
+            // 置位"时收敛轮次必能读到 submitting_ > 0
+            const bool first = !stopping_.exchange(true, std::memory_order_seq_cst);
             if (first && policy == shutdown_policy::drain) {
                 wait();
             }
@@ -563,25 +565,38 @@ namespace concurrent {
         /// 入队, 不含唤醒(批量提交方据此摊薄通知成本)
         /// @return 空 = 成功; 非空 = submit_error
         std::expected<void, submit_error> enqueue(int level, node_t* node) noexcept {
-            pending_.fetch_add(1, std::memory_order_acq_rel);
+            // 乐观预检: 已停则直接拒绝, 不触碰任何计数. 若被拒提交也抬高
+            // pending_, 持续重试的生产者会把 drop_all_queued 的收敛条件
+            // 无限重置 - 生产者等 shutdown 返回, shutdown 等生产者停手
             if (stopping_.load(std::memory_order_acquire)) [[unlikely]] {
                 // 统一出口 abandon: submit 路径节点入队前已挂 discard 钩子,
                 // 须以取消语义终结其共享状态; execute 路径节点无钩子, 等价销毁
                 abandon(node);
-                // 必须与其余完成路径一样推进空闲代际: 若在此裸减计数, 恰好
-                // 挂在 idle_gen_ 上的 shutdown(drain) 将永远等不到唤醒 -
-                // 本次递减可能正是把 pending 归零的那一次
-                complete_one();
                 return std::unexpected(submit_error::stopped);
             }
+            // Dekker 配对(两侧皆 seq_cst): 在途登记先于复查. 若复查仍未
+            // 见置位, 依全序"登记 < 复查 < 置位 < 收敛轮读", 轮次必能读到
+            // submitting_ > 0 而继续等待, "越过检查却在途"的提交不会被漏
+            // 计; 反之复查见置位则撤销登记走拒绝路径, 不留痕迹
+            submitting_.fetch_add(1, std::memory_order_seq_cst);
+            if (stopping_.load(std::memory_order_seq_cst)) [[unlikely]] {
+                submitting_.fetch_sub(1, std::memory_order_seq_cst);
+                abandon(node);
+                return std::unexpected(submit_error::stopped);
+            }
+            // pending_ 只计已入队/运行中的工作: wait() 与 drain 的计数语义
+            // 自此与"正在尝试提交"解耦
+            pending_.fetch_add(1, std::memory_order_acq_rel);
 
             // worker 内嵌套提交: 优先本地 deque(LIFO 缓存热度)
             if (detail::tls_pool == this && ctxs_[detail::tls_worker].local[level].push(node))
                 [[likely]] {
+                submitting_.fetch_sub(1, std::memory_order_seq_cst);
                 return {};
             }
             // 外部提交或本地溢出: 全局队列(环满自动落入溢出链, 永不失败, 永不阻塞)
             (*globals_)[level].push(node);
+            submitting_.fetch_sub(1, std::memory_order_seq_cst);
             return {};
         }
 
@@ -669,7 +684,7 @@ namespace concurrent {
         /// 构造中途失败的收尾: 先让已启动的 worker 看到停止信号并唤醒它们,
         /// 再 join, 最后清空节点缓存. 之后异常方可继续传播
         void abort_partial_construction() noexcept {
-            stopping_.store(true, std::memory_order_release);
+            stopping_.store(true, std::memory_order_seq_cst);
             quitting_.store(true, std::memory_order_release);
             wake_gen_.fetch_add(1, std::memory_order_release);
             wake_gen_.notify_all();
@@ -805,12 +820,16 @@ namespace concurrent {
                         }
                     }
                 }
-                if (got == 0 && pending_.load(std::memory_order_acquire) == 0) {
+                // submitting_ 的读亦为 Dekker 配对的一环(seq_cst): 只要存在
+                // "越过检查但尚未入队"的生产者, 本轮即不静默 - 置位后不再有
+                // 新的进入者, 该计数单调收敛, 两轮静默从而是可达成的
+                if (got == 0 && pending_.load(std::memory_order_acquire) == 0 &&
+                    submitting_.load(std::memory_order_seq_cst) == 0) {
                     ++quiet_rounds;
                 } else {
                     quiet_rounds = 0;
                     if (got == 0) {
-                        std::this_thread::yield(); // 计数由在途任务持有: 让出 CPU 等其收尾
+                        std::this_thread::yield(); // 计数由在途任务/提交持有: 让出 CPU 等其收尾
                     }
                 }
             }
@@ -862,6 +881,10 @@ namespace concurrent {
         alignas(64) mutable std::atomic<std::int64_t> pending_{0};
         alignas(64) std::atomic<std::uint64_t> wake_gen_{0};
         alignas(64) mutable std::atomic<std::uint64_t> idle_gen_{0};
+        /// 提交在途计数: "乐观预检通过"到"入队完成"之间的生产者个数.
+        /// 与 pending_ 分工 - 它只兜住竞态窗口(置位瞬间仍有生产者越过
+        /// 检查), 不计已入队的工作; drain 收敛据此等完最后的在途提交
+        alignas(64) std::atomic<std::int64_t> submitting_{0};
         /// route 的每次提交都 acquire 读 stopping_; 与高频递增的 id_seq_
         /// 各占一行, 避免读写互弹缓存行
         alignas(64) std::atomic<bool> stopping_{false};
