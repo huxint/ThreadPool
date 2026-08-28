@@ -123,6 +123,7 @@ namespace concurrent {
         static constexpr int PAUSE_BATCH = 16; ///< 每轮探测间的让核步长
 
         using node_t = detail::task_node;
+        using body_t = decltype(node_t{}.body); ///< 节点闭包槽类型(sbo_function<80>)
         using gq_t = detail::global_queue<node_t, GLOBAL_CAP>;
         using worker_ctx_t = detail::worker_ctx<LEVELS, LOCAL_CAP, NODE_CACHE_CAP>;
         using node_pool_t = detail::mpmc_ring<node_t*, NODE_POOL_CAP>;
@@ -476,19 +477,19 @@ namespace concurrent {
             } catch (const std::bad_alloc&) {
                 return nullptr;
             }
-            node_t* node = acquire_node();
-            if (!node) [[unlikely]] {
-                return nullptr; // st 随作用域释放
-            }
 
             if constexpr (TRACE) {
                 st->id = next_id();
             }
-
             auto* self = this;
             const trace_env_t env = make_trace_env(st->id, prio);
-            node->body = [st, self, env, f = std::forward<F>(f),
-                          ... a = std::forward<Args>(args)]() mutable noexcept {
+
+            // 闭包先于取节点: 构建(F/实参拷贝, sbo_function 堆模式分配)是本
+            // 函数唯一可能抛的用户代码段, 此时节点尚在缓存/池中, 失败即无事
+            // 可回收 —— 若先 acquire_node 再构建, 每次失败会永久漏掉一个
+            // 128B 节点。构造期异常原样传播(见 build_submit_node @return)
+            body_t body = [st, self, env, f = std::forward<F>(f),
+                           ... a = std::forward<Args>(args)]() mutable noexcept {
                 self->run_task_body(*st, env, [&]() -> R {
                     if constexpr (detail::takes_token_v<F, Args...>) {
                         return std::invoke(std::move(f), st->source.get_token(), std::move(a)...);
@@ -497,6 +498,12 @@ namespace concurrent {
                     }
                 });
             };
+
+            node_t* node = acquire_node();
+            if (!node) [[unlikely]] {
+                return nullptr; // st / body 随作用域释放
+            }
+            node->body = std::move(body);
 
             // 关闭丢弃路径的终结钩子: 以取消语义收尾共享状态并发布完成,
             // 使持有 task 句柄的一方经错误通道观测到 operation_cancelled
@@ -528,19 +535,15 @@ namespace concurrent {
 
         template <typename F, typename... Args>
         std::expected<void, submit_error> execute_impl(task_priority prio, F&& f, Args&&... args) {
-            node_t* node = acquire_node();
-            if (!node) [[unlikely]] {
-                return std::unexpected(submit_error::out_of_memory);
-            }
-
             auto* self = this;
             std::uint64_t id = 0;
             if constexpr (TRACE) {
                 id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
             }
             const trace_env_t env = make_trace_env(id, prio);
-            node->body = [self, env, f = std::forward<F>(f),
-                          ... a = std::forward<Args>(args)]() mutable noexcept {
+            // 同 build_submit_node: 闭包先于取节点, 构建失败无物可回收
+            body_t body = [self, env, f = std::forward<F>(f),
+                           ... a = std::forward<Args>(args)]() mutable noexcept {
                 if constexpr (TRACE) {
                     self->trace_begin(env.id, env.prio);
                 }
@@ -550,6 +553,12 @@ namespace concurrent {
                 }
                 self->complete_one();
             };
+
+            node_t* node = acquire_node();
+            if (!node) [[unlikely]] {
+                return std::unexpected(submit_error::out_of_memory);
+            }
+            node->body = std::move(body);
 
             if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
                 return std::unexpected(ok.error());
@@ -562,11 +571,6 @@ namespace concurrent {
         template <typename F, typename... Args>
         std::expected<std::stop_source, submit_error>
         execute_cancellable_impl(task_priority prio, F&& f, Args&&... args) {
-            node_t* node = acquire_node();
-            if (!node) [[unlikely]] {
-                return std::unexpected(submit_error::out_of_memory);
-            }
-
             // 取消源生命周期随闭包: 调用方句柄失效后任务仍可安全查询
             auto source = std::make_shared<std::stop_source>();
             auto* self = this;
@@ -575,8 +579,9 @@ namespace concurrent {
                 id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
             }
             const trace_env_t env = make_trace_env(id, prio);
-            node->body = [self, env, source, f = std::forward<F>(f),
-                          ... a = std::forward<Args>(args)]() mutable noexcept {
+            // 同上面两条提交路径: source/闭包(均可能抛)先于取节点
+            body_t body = [self, env, source, f = std::forward<F>(f),
+                           ... a = std::forward<Args>(args)]() mutable noexcept {
                 if constexpr (TRACE) {
                     self->trace_begin(env.id, env.prio);
                 }
@@ -592,6 +597,12 @@ namespace concurrent {
                 }
                 self->complete_one();
             };
+
+            node_t* node = acquire_node();
+            if (!node) [[unlikely]] {
+                return std::unexpected(submit_error::out_of_memory);
+            }
+            node->body = std::move(body);
 
             if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
                 return std::unexpected(ok.error());
