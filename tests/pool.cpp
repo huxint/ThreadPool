@@ -953,7 +953,7 @@ TEST_SUITE("concurrent.pool") {
             CHECK(delta_mb < 64);
         }
 #else
-        (void)0; // 非 Linux 或 ASan: 静默跳过
+        static_cast<void>(0); // 非 Linux 或 ASan: 静默跳过
 #endif
     }
 }
