@@ -281,6 +281,36 @@ TEST_SUITE("concurrent.pool") {
         CHECK(!p.running());
     }
 
+    // 回归: 闭包构建失败(实参拷贝抛 bad_alloc)不得泄漏节点, 池保持可用.
+    // 节点在"闭包构建成功"之后才被取出; 若先取后再构建, 每次失败即永久
+    // 漏掉一个 128B 节点(计数分配器实测每次失败净增 +1), 且反复失败会抽干
+    // 全局空闲节点池. ASan 构建另行覆盖"半成品节点"的误接行为
+    TEST_CASE("failed_closure_construction_does_not_leak_or_disable_pool") {
+        struct throwing_copy {
+            int v = 0;
+            explicit throwing_copy(int x) : v(x) {}
+            throwing_copy(const throwing_copy&) { throw std::bad_alloc{}; }
+            throwing_copy(throwing_copy&&) noexcept = default;
+        };
+
+        pool p({.threads = 2});
+        throwing_copy t{7};
+        for (int i = 0; i < 1000; ++i) {
+            auto r = p.submit([](throwing_copy x) { return x.v; }, t); // 拷贝构造必抛
+            CHECK(!r.has_value());
+            CHECK(r.error() == submit_error::out_of_memory);
+        }
+        // 失败不得损坏后续提交路径: 池继续正常执行并完成
+        {
+            auto ok = p.submit([] { return 41; });
+            REQUIRE(ok.has_value());
+            CHECK(ok->get().value_or(0) == 41);
+        }
+        static_cast<void>(p.execute([]() noexcept {}));
+        p.wait();
+        CHECK(p.running());
+    }
+
     TEST_CASE("shutdown_idempotent") {        pool p({.threads = 2});
         static_cast<void>(p.execute([]() noexcept {}));
         p.shutdown();
