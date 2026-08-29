@@ -112,8 +112,8 @@ namespace concurrent {
         /// 随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不来取)
         static constexpr std::size_t NODE_CACHE_CAP = 1024;
         /// 全局空闲节点池上限: worker 本地缓存溢出时归还于此, 供外部生产者
-        /// 跨线程复用. 无此环节则每任务一次跨线程 free, fire-and-forget
-        /// 吞吐掉约 4 倍(见 A3 回退修复)
+        /// 跨线程复用. 无此环节则每任务一次跨线程 free, 实测 fire-and-forget
+        /// 吞吐掉约 4 倍
         static constexpr std::size_t NODE_POOL_CAP = 4096;
         /// stopping_ 置位后 worker 嵌套提交的放行预算: 防"自适应派生"型任务
         /// (派生速率不衰减)在关闭窗口内无限繁殖令 shutdown 永不返回.
@@ -973,7 +973,7 @@ namespace concurrent {
                     if (got == 0) {
                         if (pending_.load(std::memory_order_acquire) != 0) {
                             // 计数由在途任务持有: 挂在空闲代际上而非 yield 空转 -
-                            // discard 期长任务在跑时, 本线程原先会烧满整个任务
+                            // 后者在 discard 期长任务跑着时会烧满整个任务
                             // 时长. 复检后仍非零才睡(complete_one 把"归零"与
                             // bump/notify 原子配对, 不会睡过终点); 虚假唤醒由
                             // 外层轮次结构容忍
@@ -1072,7 +1072,7 @@ namespace concurrent {
         /// 堆分配以保持池对象本身可安全栈上构造; 热路径仅多一次指针解引用
         std::unique_ptr<std::array<gq_t, LEVELS>> globals_;
         /// !TRACE 时零尺寸(monostate + [[no_unique_address]]), 三个
-        /// move_only_function 槽位不再白占池对象
+        /// move_only_function 槽位不占池对象空间
         [[no_unique_address]] std::conditional_t<TRACE, trace_hooks, std::monostate> hooks_;
         std::size_t n_threads_ = 0;
         /// 睡前忙等预算(options::spin_budget, 构造后只读)

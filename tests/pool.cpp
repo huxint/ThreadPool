@@ -342,12 +342,11 @@ TEST_SUITE("concurrent.pool") {
         }
     }
 
-    // 回归: shutdown(drain) 与并发提交之间曾有三条独立的挂死路径 -
+    // 回归: shutdown(drain) 与并发提交之间有三条须守住的挂死窗口 -
     //   1. 提交被拒时裸减 pending 而不推进空闲代际, 挂在 idle_gen_ 上的
-    //      wait() 等不到唤醒(修复前实测第 8~27 轮复现)
+    //      wait() 等不到唤醒
     //   2. worker 以 stopping_ 为退出判据, 会在 drain 的 wait() 期间集体离场,
     //      而"已越过拒绝检查"的在途提交随后才落队 -> pending 永不归零
-    //      (修复前实测第 187~331 轮复现)
     //   3. worker 先检查退出条件再读 wake_gen_, 若两者之间恰好发生置位+递增,
     //      wait(g) 将永久阻塞 -> workers_.clear() 的 join 挂死
     //
@@ -390,9 +389,9 @@ TEST_SUITE("concurrent.pool") {
         CHECK(completed == rounds);
     }
 
-    // 回归(E0 活锁): 只要任何线程还在持续尝试提交(哪怕全部被拒),
-    // shutdown(drain) 就必须仍能返回. 修复前被拒提交会瞬时抬高 pending_,
-    // 收敛条件被无限重置, 生产者与 shutdown 互等
+    // 回归(活锁): 只要任何线程还在持续尝试提交(哪怕全部被拒),
+    // shutdown(drain) 就必须仍能返回. 若被拒提交也瞬时抬高 pending_,
+    // 收敛条件会被无限重置, 生产者与 shutdown 互等
     TEST_CASE("shutdown_returns_while_producers_keep_retrying") {
         tu::deadlock_watchdog wd{30s, "shutdown_returns_while_producers_keep_retrying"};
         pool p({.threads = 2});
@@ -523,7 +522,7 @@ TEST_SUITE("concurrent.pool") {
         CHECK(observed_stop.load());
     }
 
-    // 回归: 泛型 callable 对普通/可取消两条 execute 路径皆可行(原先二义).
+    // 回归: 泛型 callable 对普通/可取消两条 execute 路径皆可行(须消歧).
     // 消歧规则: 无 token 也可调用的归普通重载; 必须 token 的归可取消重载
     TEST_CASE("execute_overload_disambiguation_on_generic_callable") {
         basic_pool<decltype(cancellable)> p({.threads = 1});
@@ -947,7 +946,7 @@ TEST_SUITE("concurrent.pool") {
             const long after = rss_pages();
             REQUIRE(after > 0);
             const long delta_mb = (after - before) * page / (1024 * 1024);
-            // 未修复版本实测: 4 worker x 百万任务滞留约 120+ MiB(112B 节点
+            // 无上限缓存实测: 4 worker x 百万任务滞留约 120+ MiB(112B 节点
             // 入 malloc 128 桶); 上界 64 MiB 距满额缓存(4 x 128 KiB)与
             // 分配器噪声均有充分裕量
             CHECK(delta_mb < 64);

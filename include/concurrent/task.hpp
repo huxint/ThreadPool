@@ -28,9 +28,8 @@ namespace concurrent {
     struct operation_cancelled {};
 
     /// 无效任务的错误标记: 默认构造的句柄经 get(), 或结果已被消费后的
-    /// 再次 get(). 此前用空 exception_ptr 承载 - 用户最自然的
-    /// rethrow_exception 在该路径是 UB, is_cancelled / submit_error_of
-    /// 也一概返回"没事"; 具名化后可安全重抛与判别
+    /// 再次 get(). 具名类型使该路径可安全重抛, 也可被 is_cancelled /
+    /// submit_error_of 判别为"非取消, 非提交失败"
     struct invalid_task {};
 
     /// 错误通道中 invalid_task 的错误指针

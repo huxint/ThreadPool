@@ -19,7 +19,7 @@ concept deque_ok = requires { typename chase_lev_deque<T, C>; };
 
 TEST_SUITE("concurrent.detail") {
 
-    // 回归: 手写 (C & (C-1)) == 0 在 C == 0 时为真 -> 零容量曾放行,
+    // 回归: 手写 (C & (C-1)) == 0 在 C == 0 时为真 -> 零容量会被放行,
     // mask = -1 + 零长数组即 UB. has_single_bit 天然拒绝 0 与非两的幂
     TEST_CASE("capacity_constraints_reject_zero_and_non_pow2") {
         static_assert(!ring_ok<int*, 0>);
