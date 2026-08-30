@@ -102,6 +102,27 @@ namespace concurrent::detail {
             return vt_ != nullptr;
         }
 
+        /**
+         * @brief 就地构造可调用体: make() 返回的纯右值直接落在本对象的存储上
+         *        (保证的复制消除), 免去"先建临时再移动进来"的一次移动构造 + 析构
+         *
+         * @pre 当前为空(*this 为 false)
+         * @note make() 抛出时本对象保持为空, 存储原样可用
+         */
+        template <typename Factory>
+            requires std::is_invocable_r_v<R, std::decay_t<std::invoke_result_t<Factory>>&>
+        void emplace_with(Factory&& make) {
+            using FD = std::decay_t<std::invoke_result_t<Factory>>;
+            if constexpr (sizeof(FD) <= SboBytes && alignof(FD) <= alignof(std::max_align_t)) {
+                ::new (static_cast<void*>(storage_)) FD(std::forward<Factory>(make)());
+                vt_ = inplace_vt<FD>();
+            } else {
+                FD* p = new FD(std::forward<Factory>(make)()); // bad_alloc 仅在提交边界被捕获
+                ::new (static_cast<void*>(storage_)) FD*(p);
+                vt_ = heap_vt<FD>();
+            }
+        }
+
         R operator()() { return vt_->invoke(storage_); }
 
         void reset() noexcept {

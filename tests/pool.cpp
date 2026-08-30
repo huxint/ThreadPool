@@ -837,6 +837,52 @@ TEST_SUITE("concurrent.pool") {
         CHECK(done.load() == 100);
     }
 
+    // 稀疏提交: 间隔大于自旋预算, 每轮 worker 都在熟睡, 唤醒全靠生产者的
+    // 登记复查协议. 分别覆盖"全睡"(预算 0)与"有自旋者"(默认预算)两条路径
+    TEST_CASE("sparse_submissions_never_lose_wakeup") {
+        constexpr int n = 100;
+        for (const auto budget : {0us, 64us}) {
+            pool p({.threads = 2, .spin_budget = budget});
+            std::atomic<int> done{0};
+            for (int i = 0; i < n; ++i) {
+                static_cast<void>(p.execute([&done]() noexcept {
+                    done.fetch_add(1, std::memory_order_relaxed);
+                }));
+                if (i + 1 != n) {
+                    std::this_thread::sleep_for(200us); // 长于预算: 提交前必已入睡
+                }
+            }
+            const auto ok = p.wait_for(10s);
+            CHECK(ok);
+            CHECK(done.load() == n);
+        }
+    }
+
+    // 批量入队须唤醒足够多的 worker: 任务们只在汇合点互相等待, 若只被一个
+    // worker 认领则全员永久自旋(看门狗兜底); 串行消费同样无法越过汇合点
+    TEST_CASE("submit_each_wakes_multiple_workers") {
+        tu::deadlock_watchdog wd(30s, "submit_each_wakes_multiple_workers");
+        pool p({.threads = 4, .spin_budget = 0us});
+        constexpr int n = 4;
+        std::atomic<int> arrived{0};
+        std::atomic<int> done{0};
+        std::vector<int> v(n);
+        auto tasks = p.submit_each(v, [&](int) {
+            arrived.fetch_add(1, std::memory_order_acq_rel);
+            while (arrived.load(std::memory_order_acquire) < n) {
+                std::this_thread::yield();
+            }
+            done.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        });
+        REQUIRE(tasks.has_value());
+        CHECK(p.wait_for(30s));
+        CHECK(done.load() == n);
+        for (auto& t : *tasks) {
+            CHECK(t.get().value_or(-1) == 0);
+        }
+    }
+
     // drain 放行 worker 内嵌套提交: 闸门挡住全部 worker, 树整体在
     // stopping_ 之后展开 -> 每一次嵌套派生都走放行路径, 全部叶子须完成
     TEST_CASE("shutdown_drain_completes_nested_fork_join_tree") {

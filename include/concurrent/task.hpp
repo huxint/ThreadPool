@@ -214,8 +214,12 @@ namespace concurrent {
 
         /**
          * @brief 任务共享状态: 单次堆分配. 完成等待走 futex(atomic::wait),
-         *        热路径无互斥, 无条件变量; 无条件内嵌 stop_source(约 16B),
+         *        热路径无互斥, 无条件变量; 取消标志是状态内的一个 atomic<bool>,
          *        使可取消与非可取消任务共用同一套类型
+         *
+         * 真正的 std::stop_source 仅在 callable 接受 stop_token 时实体化 -
+         * libstdc++ 的 stop_source 默认构造即一次堆分配, 而不轮询 token 的
+         * 任务只可能被 task::request_stop() 在开跑前取消, 一个原子标志足矣
          *
          * finish 先发布完成, 再内联续延 - 续延内部对父任务的等待不会死锁
          */
@@ -224,8 +228,7 @@ namespace concurrent {
         public:
             using value_type = T;
 
-            std::uint64_t id = 0;      ///< trace 任务编号
-            std::stop_source source{}; ///< 取消源; 非取消提交时不可触发
+            std::uint64_t id = 0; ///< trace 任务编号
 
             /// value_ 是裸字节缓冲, 不会自行调用 T 的析构函数. 结果值未被取走
             /// 就析构本状态时(只 wait 不 get / 丢弃组合子中间态 / 只迭代半个
@@ -242,15 +245,41 @@ namespace concurrent {
             shared_state(const shared_state&) = delete ("task states are shared, never copied");
             shared_state& operator=(const shared_state&) = delete ("task states are never copied");
 
+            /// 实体化真正的取消源. 只由提交路径在状态尚未交给任何其他线程时
+            /// 调用(callable 接受 stop_token 时), 此后 source_ 只读
+            void enable_stop() { source_ = std::stop_source{}; }
+
+            [[nodiscard]]
+            std::stop_token get_token() const noexcept {
+                return source_.get_token();
+            }
+
+            void request_stop() noexcept {
+                stop_.store(true, std::memory_order_release);
+                source_.request_stop(); // 无状态源(未 enable_stop)上是无操作
+            }
+
+            [[nodiscard]]
+            bool stop_requested() const noexcept {
+                return stop_.load(std::memory_order_acquire);
+            }
+
             /// 完成路径(任务体外壳恰好调用一次)
             void finish() noexcept {
-                cont_node* list;
-                {
-                    std::scoped_lock g{lock_};
-                    list = std::exchange(conts_, nullptr);
-                    done_.store(1, std::memory_order_release);
+                // 续延链是 Treiber 栈, 以哨兵值封口: exchange 一步既取走全链
+                // 又拒绝后来的 attach, 无需互斥. acq_rel 使 attach 侧看到
+                // 封口时, 本状态的结果/异常/取消字段已然可见
+                cont_node* list = conts_.exchange(closed(), std::memory_order_acq_rel);
+                if (list == closed()) [[unlikely]] {
+                    return; // 已经完成过: 封口值不是链表, 不可遍历
                 }
-                done_.notify_all();
+                done_.store(1, std::memory_order_release);
+                // 等待者自计数: 无人等待时连库内的等待者查表都免掉
+                // (Dekker 配对: 等待方先登记再复查 done_, 见 wait_done)
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (waiters_.load(std::memory_order_acquire) != 0) [[unlikely]] {
+                    done_.notify_all();
+                }
                 ++cont_depth; // 本帧的续延以内联深度计(见 cont_depth_limit)
                 while (list) {
                     cont_node* n = std::exchange(list, list->next);
@@ -268,11 +297,14 @@ namespace concurrent {
             /// 附加续延; 若已完成返回 false(调用方需立即内联执行)
             [[nodiscard]]
             bool attach(cont_node* c) noexcept {
-                std::scoped_lock g{lock_};
-                if (done_.load(std::memory_order_relaxed) == 1) {
-                    return false;
-                }
-                c->next = std::exchange(conts_, c);
+                cont_node* head = conts_.load(std::memory_order_acquire);
+                do {
+                    if (head == closed()) {
+                        return false;
+                    }
+                    c->next = head;
+                } while (!conts_.compare_exchange_weak(head, c, std::memory_order_acq_rel,
+                                                       std::memory_order_acquire));
                 return true;
             }
 
@@ -326,18 +358,22 @@ namespace concurrent {
                 return exc_;
             }
 
-            [[nodiscard]]
-            std::atomic<std::uint32_t>& raw_done() noexcept {
-                return done_;
-            }
-
             void wait_done() const {
                 // 注意形态: acquire 观测必须发生在本线程的循环条件里
                 // libstdc++ 的 wait 唤醒重载不保证携带 acquire 序(TSan 实证缺边),
                 // 若依赖其内部重载读取, 将看不到 finish 所发布的值/异常/取消字段
+                if (done_.load(std::memory_order_acquire) != 0) [[likely]] {
+                    return;
+                }
+                // 登记 -> 栅栏 -> 复查: 与 finish 的"发布 -> 栅栏 -> 读登记"
+                // 构成 Dekker 配对. 复查漏看完成则对方必已看到本次登记,
+                // 从而照常 notify; 反之 wait(0) 见 done_ 非零即刻返回
+                waiters_.fetch_add(1, std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
                 while (done_.load(std::memory_order_acquire) == 0) {
                     done_.wait(0, std::memory_order_acquire);
                 }
+                waiters_.fetch_sub(1, std::memory_order_release);
             }
 
             /// 取走结果. invalid_task 标记表示结果已被消费
@@ -358,9 +394,18 @@ namespace concurrent {
             }
 
         private:
-            spinlock lock_{};
-            cont_node* conts_ = nullptr;
+            /// 续延链的封口哨兵: conts_ 取此值即"已完成, 不再接受 attach".
+            /// 用状态自身的地址, 与任何真实续延节点地址必然不同
+            [[nodiscard]]
+            cont_node* closed() const noexcept {
+                return reinterpret_cast<cont_node*>(const_cast<shared_state*>(this));
+            }
+
+            std::atomic<cont_node*> conts_{nullptr};
             std::atomic<std::uint32_t> done_{0};
+            mutable std::atomic<std::uint32_t> waiters_{0};
+            std::stop_source source_{std::nostopstate};
+            std::atomic<bool> stop_{false};
             std::exception_ptr exc_ = nullptr;
             [[no_unique_address]]
             typename value_storage<T>::type value_{};
@@ -680,7 +725,7 @@ namespace concurrent {
         /// 请求取消(仅当任务体轮询 token 或尚未开跑时有意义)
         void request_stop() noexcept {
             if (st_) {
-                st_->source.request_stop();
+                st_->request_stop();
             }
         }
 

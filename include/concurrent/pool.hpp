@@ -78,8 +78,8 @@ namespace concurrent {
      * 零 throw: 一切失败经 std::expected 报告; 任务体异常被捕获并透传至结果通道;
      * execute 要求 callable 为 noexcept - 从类型系统保证遗忘型任务零异常逃逸
      *
-     * 取消: 所有状态无条件内嵌 stop_source, 未开跑即取消的任务体被跳过并标记
-     * operation_cancelled
+     * 取消: 每个任务状态都带取消标志, 未开跑即取消的任务体被跳过并标记
+     * operation_cancelled; 真正的 stop_source 仅在 callable 轮询 token 时实体化
      *
      * @tparam Flags 特性标签: priority / cancellable / trace / worker_cap<N> /
      *                queue_cap<Global, Local>
@@ -94,7 +94,7 @@ namespace concurrent {
         static constexpr bool PRIORITY = detail::has_priority_v<Flags...>;
         static constexpr bool TRACE = detail::has_trace_v<Flags...>;
         /// cancellable 标签约束"返回取消源的 execute 重载"的可见性;
-        /// submit 的 token 感知不受此限制(状态无条件携带取消源)
+        /// submit 的 token 感知不受此限制(状态自带取消标志)
         static constexpr bool CANCELLABLE_TAG = detail::has_cancellable_v<Flags...>;
         static constexpr int LEVELS = PRIORITY ? 3 : 1;
         static constexpr std::size_t WORKER_CAP = detail::worker_capacity_v<Flags...>;
@@ -115,15 +115,35 @@ namespace concurrent {
         /// 跨线程复用. 无此环节则每任务一次跨线程 free, 实测 fire-and-forget
         /// 吞吐掉约 4 倍
         static constexpr std::size_t NODE_POOL_CAP = 4096;
-        /// stopping_ 置位后 worker 嵌套提交的放行预算: 防"自适应派生"型任务
+        /// stopping 置位后 worker 嵌套提交的放行预算: 防"自适应派生"型任务
         /// (派生速率不衰减)在关闭窗口内无限繁殖令 shutdown 永不返回.
         /// 覆盖约 depth-21 满二叉树的派生量, 耗尽退回拒绝(stopped);
         /// 正常运行零触碰
         static constexpr std::int64_t DRAIN_NESTED_BUDGET = 4'000'000;
         static constexpr int PAUSE_BATCH = 16; ///< 每轮探测间的让核步长
+        /// idle_state_ 的两个计数单位(高 32 位自旋者, 低 32 位睡眠者);
+        /// worker 数上限 65536, 两侧计数均不可能溢出各自的 32 位
+        static constexpr std::uint64_t SPINNER_UNIT = std::uint64_t{1} << 32;
+        static constexpr std::uint64_t SLEEPER_UNIT = 1;
+        /// state_ 的位布局(见成员声明)
+        static constexpr std::uint64_t STOPPING_BIT = 1;
+        static constexpr std::uint64_t PENDING_UNIT = 2;
+
+        [[nodiscard]]
+        static constexpr std::uint64_t spinner_count(std::uint64_t s) noexcept {
+            return s >> 32;
+        }
+        [[nodiscard]]
+        static constexpr std::uint64_t sleeper_count(std::uint64_t s) noexcept {
+            return s & 0xFFFF'FFFFull;
+        }
+
+        [[nodiscard]]
+        std::uint64_t pending_count() const noexcept {
+            return state_.load(std::memory_order_acquire) >> 1;
+        }
 
         using node_t = detail::task_node;
-        using body_t = decltype(node_t{}.body); ///< 节点闭包槽类型(sbo_function<80>)
         using gq_t = detail::global_queue<node_t, GLOBAL_CAP>;
         using worker_ctx_t = detail::worker_ctx<LEVELS, LOCAL_CAP, NODE_CACHE_CAP>;
         using node_pool_t = detail::mpmc_ring<node_t*, NODE_POOL_CAP>;
@@ -173,7 +193,7 @@ namespace concurrent {
                 globals_ = std::make_unique<std::array<gq_t, LEVELS>>();
                 spawn_workers();
             } catch (...) {
-                // 已就位的 worker 只在看到 stopping_ 后才退出循环; 若跳过这步,
+                // 已就位的 worker 只在看到停止信号后才退出循环; 若跳过这步,
                 // 成员析构中 jthread 的 join 会永久阻塞
                 abort_partial_construction();
                 throw;
@@ -308,7 +328,7 @@ namespace concurrent {
                 }
             }
             if (!staged.empty()) {
-                notify_wake();
+                notify_wake_n(staged.size());
             }
             return out;
         }
@@ -377,9 +397,9 @@ namespace concurrent {
 
         /// 阻塞直至全部任务完成(排队 + 运行中). 虚假唤醒安全
         void wait() const noexcept {
-            while (pending_.load(std::memory_order_acquire) != 0) {
-                std::uint64_t g = idle_gen_.load(std::memory_order_acquire);
-                if (pending_.load(std::memory_order_acquire) == 0) {
+            while (pending_count() != 0) {
+                std::uint32_t g = idle_gen_.load(std::memory_order_acquire);
+                if (pending_count() == 0) {
                     return;
                 }
                 idle_gen_.wait(g); // futex 睡眠; 推送方 bump 代际唤醒
@@ -397,7 +417,7 @@ namespace concurrent {
         template <typename Clock, typename Dur>
         [[nodiscard]]
         bool wait_until(const std::chrono::time_point<Clock, Dur>& tp) const noexcept {
-            while (pending_.load(std::memory_order_acquire) != 0) {
+            while (pending_count() != 0) {
                 const auto now = Clock::now();
                 if (now >= tp) {
                     return false;
@@ -417,9 +437,10 @@ namespace concurrent {
         /// 整体完成而非中途断链. 可并发调用: 首个调用者的 policy 生效, 其余
         /// 调用者阻塞至拆除完成后做一次空收敛
         void shutdown(shutdown_policy policy = shutdown_policy::drain) noexcept {
-            // seq_cst: 与 enqueue 侧的 Dekker 配对另一半, 保证"在途登记先于
-            // 置位"时收敛轮次必能读到 submitting_ > 0
-            const bool first = !stopping_.exchange(true, std::memory_order_seq_cst);
+            // 与 enqueue 的占坑 RMW 同处一个字: 修改序全序保证"置位之前占坑
+            // 成功"的在途提交必被收敛轮次看到(见 enqueue)
+            const bool first = (state_.fetch_or(STOPPING_BIT, std::memory_order_acq_rel) &
+                                STOPPING_BIT) == 0;
             if (first && policy == shutdown_policy::drain) {
                 wait();
             }
@@ -439,7 +460,7 @@ namespace concurrent {
 
         [[nodiscard]]
         bool running() const noexcept {
-            return !stopping_.load(std::memory_order_acquire);
+            return (state_.load(std::memory_order_acquire) & STOPPING_BIT) == 0;
         }
 
         [[nodiscard]]
@@ -474,6 +495,12 @@ namespace concurrent {
                                   Args&&... args) {
             try {
                 st = detail::make_state<R>();
+                if constexpr (detail::takes_token_v<F, Args...>) {
+                    // 只有轮询 token 的任务需要真正的 stop_source(一次堆分配);
+                    // 其余任务的取消由状态内的原子标志承载. 此刻状态尚未交给
+                    // 任何其他线程, 实体化不与并发的 request_stop 竞争
+                    st->enable_stop();
+                }
             } catch (const std::bad_alloc&) {
                 return nullptr;
             }
@@ -484,26 +511,30 @@ namespace concurrent {
             auto* self = this;
             const trace_env_t env = make_trace_env(st->id, prio);
 
-            // 闭包先于取节点: 构建(F/实参拷贝, sbo_function 堆模式分配)是本
-            // 函数唯一可能抛的用户代码段, 此时节点尚在缓存/池中, 失败即无事
-            // 可回收 —— 若先 acquire_node 再构建, 每次失败会永久漏掉一个
-            // 128B 节点。构造期异常原样传播(见 build_submit_node @return)
-            body_t body = [st, self, env, f = std::forward<F>(f),
-                           ... a = std::forward<Args>(args)]() mutable noexcept {
-                self->run_task_body(*st, env, [&]() -> R {
-                    if constexpr (detail::takes_token_v<F, Args...>) {
-                        return std::invoke(std::move(f), st->source.get_token(), std::move(a)...);
-                    } else {
-                        return std::invoke(std::move(f), std::move(a)...);
-                    }
-                });
-            };
-
             node_t* node = acquire_node();
             if (!node) [[unlikely]] {
-                return nullptr; // st / body 随作用域释放
+                return nullptr; // st 随作用域释放
             }
-            node->body = std::move(body);
+            // 闭包就地构造在节点的槽里: 免去一次移动构造 + 析构. 构建
+            // (F/实参拷贝, sbo_function 堆模式分配)是本函数唯一可能抛的
+            // 用户代码段, 抛出时节点仍是干净空壳, 原样归还即可
+            try {
+                node->body.emplace_with([&] {
+                    return [st, self, env, f = std::forward<F>(f),
+                            ... a = std::forward<Args>(args)]() mutable noexcept {
+                        self->run_task_body(*st, env, [&]() -> R {
+                            if constexpr (detail::takes_token_v<F, Args...>) {
+                                return std::invoke(std::move(f), st->get_token(), std::move(a)...);
+                            } else {
+                                return std::invoke(std::move(f), std::move(a)...);
+                            }
+                        });
+                    };
+                });
+            } catch (...) { // 构造期异常原样传播(见 build_submit_node @return)
+                release_node(node);
+                throw;
+            }
 
             // 关闭丢弃路径的终结钩子: 以取消语义收尾共享状态并发布完成,
             // 使持有 task 句柄的一方经错误通道观测到 operation_cancelled
@@ -541,24 +572,30 @@ namespace concurrent {
                 id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
             }
             const trace_env_t env = make_trace_env(id, prio);
-            // 同 build_submit_node: 闭包先于取节点, 构建失败无物可回收
-            body_t body = [self, env, f = std::forward<F>(f),
-                           ... a = std::forward<Args>(args)]() mutable noexcept {
-                if constexpr (TRACE) {
-                    self->trace_begin(env.id, env.prio);
-                }
-                std::invoke(std::move(f), std::move(a)...); // noexcept 由 concepts 强制
-                if constexpr (TRACE) {
-                    self->trace_end(env.id, env.prio, outcome_kind::completed);
-                }
-                self->complete_one();
-            };
 
             node_t* node = acquire_node();
             if (!node) [[unlikely]] {
                 return std::unexpected(submit_error::out_of_memory);
             }
-            node->body = std::move(body);
+            // 同 build_submit_node: 闭包就地构造, 构建失败原样归还节点
+            try {
+                node->body.emplace_with([&] {
+                    return [self, env, f = std::forward<F>(f),
+                            ... a = std::forward<Args>(args)]() mutable noexcept {
+                        if constexpr (TRACE) {
+                            self->trace_begin(env.id, env.prio);
+                        }
+                        std::invoke(std::move(f), std::move(a)...); // noexcept 由 concepts 强制
+                        if constexpr (TRACE) {
+                            self->trace_end(env.id, env.prio, outcome_kind::completed);
+                        }
+                        self->complete_one();
+                    };
+                });
+            } catch (...) {
+                release_node(node);
+                throw;
+            }
 
             if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
                 return std::unexpected(ok.error());
@@ -579,30 +616,36 @@ namespace concurrent {
                 id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
             }
             const trace_env_t env = make_trace_env(id, prio);
-            // 同上面两条提交路径: source/闭包(均可能抛)先于取节点
-            body_t body = [self, env, source, f = std::forward<F>(f),
-                           ... a = std::forward<Args>(args)]() mutable noexcept {
-                if constexpr (TRACE) {
-                    self->trace_begin(env.id, env.prio);
-                }
-                if (!source->stop_requested()) {
-                    std::invoke(std::move(f), source->get_token(), std::move(a)...);
-                    if constexpr (TRACE) {
-                        self->trace_end(env.id, env.prio, outcome_kind::completed);
-                    }
-                } else {
-                    if constexpr (TRACE) {
-                        self->trace_end(env.id, env.prio, outcome_kind::cancelled);
-                    }
-                }
-                self->complete_one();
-            };
 
             node_t* node = acquire_node();
             if (!node) [[unlikely]] {
                 return std::unexpected(submit_error::out_of_memory);
             }
-            node->body = std::move(body);
+            // 同上面两条提交路径: 闭包就地构造, 构建失败原样归还节点
+            try {
+                node->body.emplace_with([&] {
+                    return [self, env, source, f = std::forward<F>(f),
+                            ... a = std::forward<Args>(args)]() mutable noexcept {
+                        if constexpr (TRACE) {
+                            self->trace_begin(env.id, env.prio);
+                        }
+                        if (!source->stop_requested()) {
+                            std::invoke(std::move(f), source->get_token(), std::move(a)...);
+                            if constexpr (TRACE) {
+                                self->trace_end(env.id, env.prio, outcome_kind::completed);
+                            }
+                        } else {
+                            if constexpr (TRACE) {
+                                self->trace_end(env.id, env.prio, outcome_kind::cancelled);
+                            }
+                        }
+                        self->complete_one();
+                    };
+                });
+            } catch (...) {
+                release_node(node);
+                throw;
+            }
 
             if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
                 return std::unexpected(ok.error());
@@ -621,7 +664,7 @@ namespace concurrent {
             if constexpr (TRACE) {
                 trace_begin(env.id, env.prio);
             }
-            if (st.source.stop_requested()) {
+            if (st.stop_requested()) {
                 st.set_cancelled();
                 o = outcome_kind::cancelled;
             } else {
@@ -646,64 +689,48 @@ namespace concurrent {
         /// 入队, 不含唤醒(批量提交方据此摊薄通知成本)
         /// @return 空 = 成功; 非空 = submit_error
         std::expected<void, submit_error> enqueue(int level, node_t* node) noexcept {
-            // 乐观预检: 已停则直接拒绝, 不触碰任何计数. 若被拒提交也抬高
-            // pending_, 持续重试的生产者会把 drop_all_queued 的收敛条件
-            // 无限重置 - 生产者等 shutdown 返回, shutdown 等生产者停手
+            // 占坑与关闭判定合成一次 RMW: 两侧都是 state_ 上的读改写, 修改序
+            // 天然全序 —— 读回的 stopping 位为 0 即本次占坑必排在 fetch_or
+            // (置位)之前, 关闭方此后对 state_ 的任何读都会看到这份 pending,
+            // 收敛轮次不会在"越过检查却尚未入队"的窗口里静默
             //
-            // 唯一例外: 本池 worker 的嵌套提交放行(有限预算). 正在运行的
-            // fork-join 型任务在 shutdown 期间派生子任务, 语义上属于
-            // "停机前已接受工作"的延续, 拒绝它会让 drain 变相丢弃在途
-            // 计算树; 放行不登记 submitting_: 嵌套提交的父任务持有
-            // pending_ 计数直至派生返回, wait/drop 的收敛判据不可能
-            // 越过它静默(见 nested_submit_permitted)
-            bool registered = false;
-            if (stopping_.load(std::memory_order_acquire)) [[unlikely]] {
+            // 前置的乐观预检只为"已停"这一稳定态服务: 被拒的提交不得抬高
+            // pending, 否则持续重试的生产者会把 drop_all_queued 的收敛条件
+            // 无限重置 - 生产者等 shutdown 返回, shutdown 等生产者停手
+            std::uint64_t prev = state_.load(std::memory_order_acquire);
+            if ((prev & STOPPING_BIT) == 0) [[likely]] {
+                prev = state_.fetch_add(PENDING_UNIT, std::memory_order_acq_rel);
+                if ((prev & STOPPING_BIT) != 0) [[unlikely]] {
+                    complete_one(); // 置位赶在占坑之前: 撤销, 不留痕迹
+                }
+            }
+            // 已停的唯一例外: 本池 worker 的嵌套提交放行(有限预算). 正在运行
+            // 的 fork-join 型任务在 shutdown 期间派生子任务, 语义上属于"停机前
+            // 已接受工作"的延续, 拒绝它会让 drain 变相丢弃在途计算树
+            if ((prev & STOPPING_BIT) != 0) [[unlikely]] {
                 if (!nested_submit_permitted()) [[unlikely]] {
                     // 统一出口 abandon: submit 路径节点入队前已挂 discard 钩子,
                     // 须以取消语义终结其共享状态; execute 路径节点无钩子, 等价销毁
                     abandon(node);
                     return std::unexpected(submit_error::stopped);
                 }
-            } else {
-                // Dekker 配对(两侧皆 seq_cst): 在途登记先于复查. 若复查仍未
-                // 见置位, 依全序"登记 < 复查 < 置位 < 收敛轮读", 轮次必能读到
-                // submitting_ > 0 而继续等待, "越过检查却在途"的提交不会被漏
-                // 计; 反之复查见置位则撤销登记, 走拒绝或嵌套放行, 不留痕迹
-                submitting_.fetch_add(1, std::memory_order_seq_cst);
-                if (stopping_.load(std::memory_order_seq_cst)) [[unlikely]] {
-                    submitting_.fetch_sub(1, std::memory_order_seq_cst);
-                    if (!nested_submit_permitted()) [[unlikely]] {
-                        abandon(node);
-                        return std::unexpected(submit_error::stopped);
-                    }
-                } else {
-                    registered = true;
-                }
+                state_.fetch_add(PENDING_UNIT, std::memory_order_acq_rel);
             }
-            // pending_ 只计已入队/运行中的工作: wait() 与 drain 的计数语义
-            // 自此与"正在尝试提交"解耦
-            pending_.fetch_add(1, std::memory_order_acq_rel);
 
             // worker 内嵌套提交: 优先本地 deque(LIFO 缓存热度)
             if (detail::tls_pool == this && ctxs_[detail::tls_worker].local[level].push(node))
                 [[likely]] {
-                if (registered) {
-                    submitting_.fetch_sub(1, std::memory_order_seq_cst);
-                }
                 return {};
             }
             // 外部提交或本地溢出: 全局队列(环满自动落入溢出链, 永不失败, 永不阻塞)
             (*globals_)[level].push(node);
-            if (registered) {
-                submitting_.fetch_sub(1, std::memory_order_seq_cst);
-            }
             return {};
         }
 
-        /// stopping_ 置位后本条提交是否放行: 仅本池 worker 的嵌套提交,
+        /// stopping 置位后本条提交是否放行: 仅本池 worker 的嵌套提交,
         /// 消耗有限预算(DRAIN_NESTED_BUDGET), 其余一律拒绝.
         /// 放行依赖的不变式: 调用方(worker)必在执行某个任务体, 而任务体
-        /// 在完成前持有 pending_ 计数 -> 收敛判据(pending 归零)不可能
+        /// 在完成前持有 pending 计数 -> 收敛判据(pending 归零)不可能
         /// 在派生窗口内静默成立, 在途子节点必被计入或被后续轮次消费
         [[nodiscard]]
         bool nested_submit_permitted() noexcept {
@@ -734,8 +761,12 @@ namespace concurrent {
             // 带进队列, 关闭丢弃时 abandon 便在已释放的状态上写入
             n->discard = nullptr;
             n->discard_ctx = nullptr;
-            // 归还顺序: 本地缓存(嵌套提交复用) -> 全局空闲池(外部生产者
-            // 跨线程复用) -> 分配器. 节点此刻已是干净空壳
+            recycle_node(n, worker);
+        }
+
+        /// 干净空壳节点的归还: 本地缓存(嵌套提交复用) -> 全局空闲池(外部
+        /// 生产者跨线程复用) -> 分配器
+        void recycle_node(node_t* n, std::size_t worker) noexcept {
             if (!ctxs_[worker].cache.push(n)) {
                 if (!node_pool_->try_push(n)) {
                     delete n;
@@ -743,17 +774,54 @@ namespace concurrent {
             }
         }
 
+        /// 提交路径上的归还(闭包构建失败): 调用方未必是本池 worker
+        void release_node(node_t* n) noexcept {
+            if (detail::tls_pool == static_cast<const void*>(this)) {
+                recycle_node(n, detail::tls_worker);
+            } else if (!node_pool_->try_push(n)) {
+                delete n;
+            }
+        }
+
         void notify_wake() noexcept {
-            // 稳态下(自旋预算内)没有 worker 在睡, 这次所有生产者共享一行
-            // 的 fetch_add + futex 纯属浪费 - 多生产者 x8 的主要拖累之一.
             // 不丢唤醒协议(两侧 seq_cst 栅栏, Eigen/taskflow notifier 路数):
-            // 生产者 push 后过栅栏再读 sleepers_; worker 先登记再过栅栏
-            // 复查. 若复查错过 push, 依全序登记必先于本读 - 看到登记便
-            // 照常唤醒, 丢失唤醒不可能
+            // 生产者 push 后过栅栏再读闲置状态; worker 先登记(自旋者或睡眠者)
+            // 再过栅栏复查队列. 两道 seq_cst 栅栏在全序 S 中必分先后:
+            //  - 生产者栅栏在先 -> worker 的复查必看到本次 push;
+            //  - worker 栅栏在先 -> 生产者的读必看到 worker 的登记变更.
+            // 二者必居其一, 故"见到自旋者就跳过唤醒"不会丢失唤醒: 该自旋者
+            // 要么在自旋中扫到这个任务, 要么在入睡前的复查里扫到
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            if (sleepers_.load(std::memory_order_acquire) != 0) {
+            const std::uint64_t s = idle_state_.load(std::memory_order_acquire);
+            if (spinner_count(s) == 0 && sleeper_count(s) != 0) {
                 wake_gen_.fetch_add(1, std::memory_order_release);
                 wake_gen_.notify_one(); // 单任务只唤醒一个 worker, 避免 notify_all 惊群
+            }
+        }
+
+        /// 批量入队后的唤醒: 一批 n 个任务至多需要 n 个 worker. 单次
+        /// notify_one 只唤醒一个, 整批落队却只叫醒一人时其余 worker 会一直
+        /// 睡到该 worker 逐个消费完; 自旋者已在扫队列, 只为其余的活叫人
+        void notify_wake_n(std::size_t n) noexcept {
+            if (n <= 1) [[unlikely]] {
+                notify_wake();
+                return;
+            }
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            const std::uint64_t s = idle_state_.load(std::memory_order_acquire);
+            const std::uint64_t sleepers = sleeper_count(s);
+            const std::uint64_t spinners = spinner_count(s);
+            if (sleepers == 0 || n <= spinners) {
+                return;
+            }
+            wake_gen_.fetch_add(1, std::memory_order_release);
+            const std::uint64_t want = n - spinners;
+            if (want >= sleepers) {
+                wake_gen_.notify_all();
+                return;
+            }
+            for (std::uint64_t i = 0; i < want; ++i) {
+                wake_gen_.notify_one();
             }
         }
 
@@ -761,7 +829,7 @@ namespace concurrent {
         /// wait()/shutdown(drain) 挂在 idle_gen_ 上, 任何一条完成路径漏掉
         /// 这一步都会让它们永久沉睡 - 故所有收尾必须收口于此
         void complete_one() noexcept {
-            if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            if ((state_.fetch_sub(PENDING_UNIT, std::memory_order_acq_rel) >> 1) == 1) {
                 idle_gen_.fetch_add(1, std::memory_order_release);
                 idle_gen_.notify_all();
             }
@@ -815,7 +883,7 @@ namespace concurrent {
         /// 构造中途失败的收尾: 先让已启动的 worker 看到停止信号并唤醒它们,
         /// 再 join, 最后清空节点缓存. 之后异常方可继续传播
         void abort_partial_construction() noexcept {
-            stopping_.store(true, std::memory_order_seq_cst);
+            state_.fetch_or(STOPPING_BIT, std::memory_order_acq_rel);
             quitting_.store(true, std::memory_order_release);
             wake_gen_.fetch_add(1, std::memory_order_release);
             wake_gen_.notify_all();
@@ -834,6 +902,7 @@ namespace concurrent {
                     // 有界自旋: 每批让核后重新探测全队列; 预算耗尽(或配置为 0)
                     // 才进入 futex 睡眠协议
                     const auto deadline = std::chrono::steady_clock::now() + spin_budget_;
+                    bool spinning = false;
                     while (!n) {
                         for (int s = 0; s < PAUSE_BATCH && !n; ++s) {
                             detail::cpu_relax();
@@ -841,6 +910,25 @@ namespace concurrent {
                         }
                         if (n || std::chrono::steady_clock::now() >= deadline) {
                             break;
+                        }
+                        if (!spinning) {
+                            // 首批探测就落空才向 idle_state_ 登记为自旋者:
+                            // 生产者见到自旋者即可跳过 futex 唤醒(稀疏到达下
+                            // 省掉的正是"每次提交一次系统调用", 见 notify_wake
+                            // 的不丢唤醒论证). 满载时任务间的取活间隙极短,
+                            // 那种一闪而过的空转不值得写这条共享缓存行
+                            idle_state_.fetch_add(SPINNER_UNIT, std::memory_order_relaxed);
+                            spinning = true;
+                        }
+                    }
+                    if (spinning) {
+                        const std::uint64_t prev =
+                            idle_state_.fetch_sub(SPINNER_UNIT, std::memory_order_acq_rel);
+                        // 最后一个自旋者带着活离场: 在此期间生产者的推送都因
+                        // "有自旋者"而免了唤醒, 若队列里还有剩余, 需由本线程
+                        // 接力唤醒一个睡眠者, 否则它们要等到本任务跑完才被认领
+                        if (n && spinner_count(prev) == 1 && more_work_hint(idx)) {
+                            notify_wake();
                         }
                     }
                 }
@@ -852,10 +940,10 @@ namespace concurrent {
                 // 二者的置位方都在改动后递增 wake_gen_, 故任何发生在本次读取
                 // 之后的置位都会让下面的 wait(g) 立即返回; 反之若代际未变, 则
                 // 置位方的写入必已先于本次 acquire 读可见, 下面两项检查看得到
-                const std::uint64_t g = wake_gen_.load(std::memory_order_acquire);
+                const std::uint32_t g = wake_gen_.load(std::memory_order_acquire);
 
-                // 判据是 quitting_ 而非 stopping_: 后者仅表示"拒绝新提交",
-                // 此时 drain 还要靠 worker 把队列消费干净. 若以 stopping_ 退出,
+                // 判据是 quitting_ 而非 stopping 位: 后者仅表示"拒绝新提交",
+                // 此时 drain 还要靠 worker 把队列消费干净. 若以它为退出判据,
                 // worker 会在 shutdown(drain) 的 wait() 期间集体离场, 而"已越过
                 // 拒绝检查"的在途提交随后才落队 -> pending 永不归零, wait() 悬挂
                 //
@@ -871,18 +959,19 @@ namespace concurrent {
                 //
                 // 睡眠登记与复查之间必须隔一道 seq_cst 栅栏(与 notify_wake
                 // 的生产者侧配对): 若复查错过刚 push 的活, 依全序本次登记
-                // 必先于生产者读 sleepers_ - 后者看到登记便照常唤醒; 若登记
+                // 必先于生产者读 idle_state_ - 后者看到登记便照常唤醒; 若登记
                 // 晚于该读, 则 push 必已对复查可见, 复查不会错过. 两侧必居
-                // 其一, 丢失唤醒不可能
-                sleepers_.fetch_add(1, std::memory_order_relaxed);
+                // 其一, 丢失唤醒不可能. 自旋者的注销同样先于本栅栏, 故
+                // "生产者见到自旋者便跳过唤醒"落在同一论证内
+                idle_state_.fetch_add(SLEEPER_UNIT, std::memory_order_relaxed);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (node_t* m = try_acquire(idx, seed)) {
-                    sleepers_.fetch_sub(1, std::memory_order_relaxed);
+                    idle_state_.fetch_sub(SLEEPER_UNIT, std::memory_order_relaxed);
                     execute_node(m, idx);
                     continue;
                 }
                 wake_gen_.wait(g); // 全空则睡; 推送方 bump 代际唤醒
-                sleepers_.fetch_sub(1, std::memory_order_relaxed);
+                idle_state_.fetch_sub(SLEEPER_UNIT, std::memory_order_relaxed);
             }
 
             detail::tls_pool = nullptr;
@@ -904,8 +993,7 @@ namespace concurrent {
                     return n;
                 }
             }
-            const std::size_t start = xorshift(seed) % n_threads_;
-            std::size_t vi = start;
+            std::size_t vi = bounded_rand(xorshift(seed), n_threads_);
             for (std::size_t k = 0; k < n_threads_; ++k) {
                 if (++vi == n_threads_) {
                     vi = 0;
@@ -930,9 +1018,30 @@ namespace concurrent {
             return s;
         }
 
+        /// [0, n) 上的窃取起点(Lemire 乘移法). n_threads_ 是运行期值,
+        /// 取模会编译成真正的 div - 而本函数落在每次探测的路径上
+        [[nodiscard]]
+        static constexpr std::size_t bounded_rand(std::uint32_t r, std::size_t n) noexcept {
+            return static_cast<std::size_t>((static_cast<std::uint64_t>(r) * n) >> 32);
+        }
+
+        /// 队列里是否还有未认领的工作(近似, 仅作唤醒启发, 不作同步依据).
+        /// 只看全局队列与自有本地 deque: 他人的本地 deque 非空即意味着其
+        /// 所有者正在运行, 无须唤醒第三方
+        [[nodiscard]]
+        bool more_work_hint(std::size_t idx) const noexcept {
+            for (int lv = 0; lv < LEVELS; ++lv) {
+                if ((*globals_)[lv].size_approx() != 0 ||
+                    ctxs_[idx].local[lv].size_approx() != 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /// 排空全部未开始的任务, 并收敛与并发提交的竞争残留
         ///
-        /// stopping_ 置位后新提交必然被拒, 但"已越过拒绝检查"的在途提交仍可能
+        /// stopping 置位后新提交必然被拒, 但"已越过拒绝检查"的在途提交仍可能
         /// 稍后才落队. 若只扫一轮, 这类节点会滞留队列: pending 永不归零,
         /// 之后一切 wait 都将悬挂. 故循环排空直至"队列空且计数归零"连续成立
         /// 两轮 - 提交路径为此零开销, 关闭路径多绕几轮即可收敛
@@ -962,28 +1071,21 @@ namespace concurrent {
                         }
                     }
                 }
-                // submitting_ 的读亦为 Dekker 配对的一环(seq_cst): 只要存在
-                // "越过检查但尚未入队"的生产者, 本轮即不静默 - 置位后不再有
-                // 新的进入者, 该计数单调收敛, 两轮静默从而是可达成的
-                if (got == 0 && pending_.load(std::memory_order_acquire) == 0 &&
-                    submitting_.load(std::memory_order_seq_cst) == 0) {
+                // pending 同时覆盖"已入队/运行中"与"越过检查但尚未入队"两类
+                // 在途工作(见 enqueue 的占坑 RMW): 置位后不再有新的进入者,
+                // 该计数单调收敛, 两轮静默从而是可达成的
+                if (got == 0 && pending_count() == 0) {
                     ++quiet_rounds;
                 } else {
                     quiet_rounds = 0;
                     if (got == 0) {
-                        if (pending_.load(std::memory_order_acquire) != 0) {
-                            // 计数由在途任务持有: 挂在空闲代际上而非 yield 空转 -
-                            // 后者在 discard 期长任务跑着时会烧满整个任务
-                            // 时长. 复检后仍非零才睡(complete_one 把"归零"与
-                            // bump/notify 原子配对, 不会睡过终点); 虚假唤醒由
-                            // 外层轮次结构容忍
-                            const std::uint64_t g = idle_gen_.load(std::memory_order_acquire);
-                            if (pending_.load(std::memory_order_acquire) != 0) {
-                                idle_gen_.wait(g);
-                            }
-                        } else {
-                            // 仅 submitting_ 残留(越过检查但未落队, 窗口极窄): 让出 CPU
-                            std::this_thread::yield();
+                        // 计数由在途工作持有: 挂在空闲代际上而非 yield 空转 -
+                        // 后者在 discard 期长任务跑着时会烧满整个任务时长.
+                        // 复检后仍非零才睡(complete_one 把"归零"与 bump/notify
+                        // 原子配对, 不会睡过终点); 虚假唤醒由外层轮次结构容忍
+                        const std::uint32_t g = idle_gen_.load(std::memory_order_acquire);
+                        if (pending_count() != 0) {
+                            idle_gen_.wait(g);
                         }
                     }
                 }
@@ -1036,28 +1138,29 @@ namespace concurrent {
             return PRIORITY ? p : task_priority::normal;
         }
 
-        alignas(64) mutable std::atomic<std::int64_t> pending_{0};
-        alignas(64) std::atomic<std::uint64_t> wake_gen_{0};
-        alignas(64) mutable std::atomic<std::uint64_t> idle_gen_{0};
-        /// 睡眠中(或正在入睡)的 worker 数. notify_wake 据此在稳态下免去
-        /// 全局代际 RMW; 与 worker 侧的"登记 -> 栅栏 -> 复查"构成不丢唤醒
-        /// 协议, 详见 notify_wake 与 worker_main 的注释
-        alignas(64) std::atomic<std::int64_t> sleepers_{0};
-        /// 提交在途计数: "乐观预检通过"到"入队完成"之间的生产者个数.
-        /// 与 pending_ 分工 - 它只兜住竞态窗口(置位瞬间仍有生产者越过
-        /// 检查), 不计已入队的工作; drain 收敛据此等完最后的在途提交
-        alignas(64) std::atomic<std::int64_t> submitting_{0};
-        /// route 的每次提交都 acquire 读 stopping_; 与高频递增的 id_seq_
-        /// 各占一行, 避免读写互弹缓存行
-        alignas(64) std::atomic<bool> stopping_{false};
-        /// worker 的退出判据. 与 stopping_ 分离: 前者一置位即拒绝新提交, 而
-        /// worker 必须继续消费到排空收敛之后才可离场
+        /// 提交闸门与在途计数合成一个字: bit0 = stopping(拒绝新提交),
+        /// 其余位 = pending(已入队/运行中的工作, 外加"越过检查但尚未入队"的
+        /// 在途提交). 合成之后每次提交只付一次共享行上的 RMW, 关闭与计数的
+        /// 定序也不再需要额外的 Dekker 配对(见 enqueue)
+        alignas(64) mutable std::atomic<std::uint64_t> state_{0};
+        /// 唤醒代际. 取 32 位而非 64: libstdc++ 只对 4 字节对象直接用 futex,
+        /// 更宽的类型退化为哈希代理等待池 - 代理下 notify_one 只能保守地
+        /// 唤醒全部等待者(惊群), 且不同对象会在池中相互干扰
+        alignas(64) std::atomic<std::uint32_t> wake_gen_{0};
+        alignas(64) mutable std::atomic<std::uint32_t> idle_gen_{0};
+        /// 闲置 worker 状态: 高 32 位 = 自旋中的数目, 低 32 位 = 睡眠中
+        /// (或正在入睡)的数目. 二者同处一个字, 使 notify_wake 一次载入即可
+        /// 判定"是否需要进内核"; 与 worker 侧的"登记 -> 栅栏 -> 复查"构成
+        /// 不丢唤醒协议, 详见 notify_wake 与 worker_main 的注释
+        alignas(64) std::atomic<std::uint64_t> idle_state_{0};
+        /// worker 的退出判据. 与 state_ 的 stopping 位分离: 后者一置位即
+        /// 拒绝新提交, 而 worker 必须继续消费到排空收敛之后才可离场
         alignas(64) std::atomic<bool> quitting_{false};
         alignas(64) std::atomic<std::uint64_t> id_seq_{0};
 
         /// 仅拆除路径使用; 与热路径原子量无共享行
         std::mutex shutdown_mtx_;
-        /// drain 期嵌套提交放行余额(见 DRAIN_NESTED_BUDGET), 仅 stopping_
+        /// drain 期嵌套提交放行余额(见 DRAIN_NESTED_BUDGET), 仅 stopping
         /// 置位后触碰
         std::atomic<std::int64_t> drain_nested_budget_{DRAIN_NESTED_BUDGET};
 
