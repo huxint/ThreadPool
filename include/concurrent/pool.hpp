@@ -54,6 +54,10 @@ namespace concurrent {
         /// 初始化, 免去 TLS 动态初始化守卫检查
         inline constinit thread_local const void* tls_pool = nullptr;
         inline constinit thread_local std::size_t tls_worker = 0;
+        /// 非 worker 提交者(外部生产者 / 排空线程)的记账分片槽号: 首次
+        /// 提交时自全局序号取模惰性分配, SIZE_MAX 为未分配哨兵
+        inline constinit thread_local std::size_t tls_external_cell = SIZE_MAX;
+        inline constinit std::atomic<std::size_t> g_cell_seq{0};
 
         /// submit 的结果类型: token 感知调用优先匹配
         template <typename F, typename... Args>
@@ -80,6 +84,11 @@ namespace concurrent {
      * + 分层全局可扩容队列兜底(Vyukov 环 + 溢出链). 外部提交进全局,
      * worker 内嵌套提交进本地, 本地溢出落全局; 全局环满则转入同序溢出链,
      * 提交永不阻塞, 永不拒绝
+     *
+     * 计数: pending 按线程分片记账(占坑 +1 写提交者单元, 完成 -1 写执行者
+     * 单元, 分片互不共享缓存行), 双方零争用, 求和归零即全体静默; 关闭
+     * 闸门与占坑以 Dekker 配对定序(见 enqueue), 归零唤醒的纪律见
+     * complete_one / worker_main
      *
      * 零 throw: 库自身的一切失败经 std::expected 报告; 任务体异常被捕获并透传至
      * 结果通道; execute 要求 callable 为 noexcept - 从类型系统保证遗忘型任务零
@@ -135,9 +144,10 @@ namespace concurrent {
         /// worker 数上限 65536, 两侧计数均不可能溢出各自的 32 位
         static constexpr std::uint64_t SPINNER_UNIT = std::uint64_t{1} << 32;
         static constexpr std::uint64_t SLEEPER_UNIT = 1;
-        /// state_ 的位布局(见成员声明)
-        static constexpr std::uint64_t STOPPING_BIT = 1;
-        static constexpr std::uint64_t PENDING_UNIT = 2;
+        /// pending 记账分片数(见 cells_ 声明): 每线程一个单元, 占坑/完成
+        /// 都只写本线程单元, 争用随线程数摊薄; 线程数超出时分片间共享,
+        /// 退化平滑
+        static constexpr std::size_t N_CELLS = 256;
 
         [[nodiscard]]
         static constexpr std::uint64_t spinner_count(std::uint64_t s) noexcept {
@@ -148,15 +158,28 @@ namespace concurrent {
             return s & 0xFFFF'FFFFull;
         }
 
+        /// 全量求和(分片可负, 见 cells_ 注释; 瞬时快照可能读到负值或
+        /// 残差, 归零判定只作启发, 同步依据是唤醒纪律). 冷路径专用:
+        /// wait 循环 / 排空轮次, 256 次 relaxed 载入
         [[nodiscard]]
-        std::uint64_t pending_count() const noexcept {
-            return state_.load(std::memory_order_acquire) >> 1;
+        std::int64_t pending_count() const noexcept {
+            std::int64_t sum = 0;
+            for (const auto& c : *cells_) {
+                sum += c.value.load(std::memory_order_relaxed);
+            }
+            return sum;
         }
 
         using node_t = detail::task_node;
         using gq_t = detail::global_queue<node_t, GLOBAL_CAP>;
         using worker_ctx_t = detail::worker_ctx<LEVELS, LOCAL_CAP, NODE_CACHE_CAP>;
         using node_pool_t = detail::mpmc_ring<node_t*, NODE_POOL_CAP>;
+        /// 分片单元: 包装而非对 atomic 直接 alignas(GCC 对已定义类类型
+        /// 忽略该属性), 单元独享缓存行, 分片间的假共享正是要消灭的东西
+        struct alignas(64) cell_t {
+            std::atomic<std::int64_t> value{0};
+        };
+        using cells_t = std::array<cell_t, N_CELLS>;
         using outcome_kind = task_outcome;
         using phase_kind = task_phase;
 
@@ -202,6 +225,7 @@ namespace concurrent {
             }
             node_pool_ = std::make_unique<node_pool_t>();
             globals_ = std::make_unique<std::array<gq_t, LEVELS>>();
+            cells_ = std::make_unique<cells_t>();
             try {
                 spawn_workers();
             } catch (...) {
@@ -396,7 +420,8 @@ namespace concurrent {
             });
         }
 
-        /// 阻塞直至全部任务完成(排队 + 运行中). 虚假唤醒安全
+        /// 阻塞直至全部任务完成(排队 + 运行中). 虚假唤醒安全.
+        /// 唤醒常态即时(完成路径的捷径), 最坏多等一个自旋预算(见 complete_one)
         /// @pre 调用者不得是本池的 worker - 其正在执行的任务自身就持有
         ///      pending 计数, 归零永不发生, 必死锁(Debug 构建下契约断言终止)
         void wait() const noexcept {
@@ -444,10 +469,10 @@ namespace concurrent {
         ///      归零, 必死锁(Debug 构建下契约断言终止)
         void shutdown(shutdown_policy policy = shutdown_policy::drain) noexcept {
             CONCURRENT_CONTRACT_ASSERT(!in_own_worker());
-            // 与 enqueue 的占坑 RMW 同处一个字: 修改序全序保证"置位之前占坑
-            // 成功"的在途提交必被收敛轮次看到(见 enqueue)
-            const bool first = (state_.fetch_or(STOPPING_BIT, std::memory_order_acq_rel) &
-                                STOPPING_BIT) == 0;
+            // 与 enqueue 的占坑构成 Dekker 配对: 置位与占坑后的复查都是
+            // seq_cst, 全序保证"置位之前占坑成功"的在途提交必被收敛轮次
+            // 看到(见 enqueue)
+            const bool first = !stopping_.exchange(true, std::memory_order_seq_cst);
             if (first && policy == shutdown_policy::drain) {
                 wait();
             }
@@ -467,7 +492,7 @@ namespace concurrent {
 
         [[nodiscard]]
         bool running() const noexcept {
-            return (state_.load(std::memory_order_acquire) & STOPPING_BIT) == 0;
+            return !stopping_.load(std::memory_order_acquire);
         }
 
         [[nodiscard]]
@@ -704,32 +729,35 @@ namespace concurrent {
         /// 入队, 不含唤醒(批量提交方据此摊薄通知成本)
         /// @return 空 = 成功; 非空 = submit_error
         std::expected<void, submit_error> enqueue(int level, node_t* node) noexcept {
-            // 占坑与关闭判定合成一次 RMW: 两侧都是 state_ 上的读改写, 修改序
-            // 天然全序 —— 读回的 stopping 位为 0 即本次占坑必排在 fetch_or
-            // (置位)之前, 关闭方此后对 state_ 的任何读都会看到这份 pending,
-            // 收敛轮次不会在"越过检查却尚未入队"的窗口里静默
-            //
-            // 前置的乐观预检只为"已停"这一稳定态服务: 被拒的提交不得抬高
-            // pending, 否则持续重试的生产者会把 drop_all_queued 的收敛条件
-            // 无限重置 - 生产者等 shutdown 返回, shutdown 等生产者停手
-            std::uint64_t prev = state_.load(std::memory_order_acquire);
-            if ((prev & STOPPING_BIT) == 0) [[likely]] {
-                prev = state_.fetch_add(PENDING_UNIT, std::memory_order_acq_rel);
-                if ((prev & STOPPING_BIT) != 0) [[unlikely]] {
-                    complete_one(); // 置位赶在占坑之前: 撤销, 不留痕迹
-                }
+            // 占坑与关闭判定的 Dekker 配对(与 notify_wake 的不丢唤醒同款
+            // 论证): 占坑是 cells_ 上的 SC RMW, 复查与置位都是 seq_cst,
+            // 三者在全序 S 中必分先后 -
+            //  - 占坑在前: 复查必读到未停, 且占坑先于置位, 关闭方此后对
+            //    分片的求和必看到这份份额, 收敛轮次不会在"越过检查却尚未
+            //    入队"的窗口里静默;
+            //  - 置位在前: 复查必读到已停, 撤销占坑(含归零唤醒)并拒绝.
+            // 乐观预检只为"已停"这一稳定态服务: 被拒的提交不得抬高
+            // pending, 否则持续重试的生产者会把 drop_all_queued 的收敛
+            // 条件无限重置 - 生产者等 shutdown 返回, shutdown 等生产者停手
+            const bool stopped_seen = stopping_.load(std::memory_order_acquire);
+            if (stopped_seen && !nested_submit_permitted()) [[unlikely]] {
+                // 统一出口 abandon: submit 路径节点入队前已挂 discard 钩子,
+                // 须以取消语义终结其共享状态; execute 路径节点无钩子, 等价销毁
+                abandon(node);
+                return std::unexpected(submit_error::stopped);
             }
-            // 已停的唯一例外: 本池 worker 的嵌套提交放行(有限预算). 正在运行
-            // 的 fork-join 型任务在 shutdown 期间派生子任务, 语义上属于"停机前
-            // 已接受工作"的延续, 拒绝它会让 drain 变相丢弃在途计算树
-            if ((prev & STOPPING_BIT) != 0) [[unlikely]] {
-                if (!nested_submit_permitted()) [[unlikely]] {
-                    // 统一出口 abandon: submit 路径节点入队前已挂 discard 钩子,
-                    // 须以取消语义终结其共享状态; execute 路径节点无钩子, 等价销毁
+            const std::size_t cell = cell_of_caller();
+            cells_->at(cell).value.fetch_add(1, std::memory_order_acq_rel);
+            if (!stopped_seen) [[likely]] {
+                // 预检时未停才需要复查; 已停分支(嵌套放行)复查无意义且其
+                // 收敛由父任务不变式保证(见 nested_submit_permitted)
+                if (stopping_.load(std::memory_order_seq_cst) &&
+                    !nested_submit_permitted()) [[unlikely]] {
+                    cells_->at(cell).value.fetch_sub(1, std::memory_order_acq_rel);
+                    maybe_bump_if_idle(); // 撤销后可能恰好归零: 唤醒等待者
                     abandon(node);
                     return std::unexpected(submit_error::stopped);
                 }
-                state_.fetch_add(PENDING_UNIT, std::memory_order_acq_rel);
             }
 
             // worker 内嵌套提交: 优先本地 deque(LIFO 缓存热度)
@@ -749,11 +777,26 @@ namespace concurrent {
             return detail::tls_pool == static_cast<const void*>(this);
         }
 
+        /// 记账分片槽: worker 用自身索引, 其余线程用 TLS 惰性分配的槽号.
+        /// 同一线程的全部占坑与撤销落在同一单元, 求和自洽
+        [[nodiscard]]
+        std::size_t cell_of_caller() const noexcept {
+            if (detail::tls_pool == static_cast<const void*>(this)) {
+                return detail::tls_worker % N_CELLS;
+            }
+            if (detail::tls_external_cell == SIZE_MAX) [[unlikely]] {
+                detail::tls_external_cell =
+                    detail::g_cell_seq.fetch_add(1, std::memory_order_relaxed) % N_CELLS;
+            }
+            return detail::tls_external_cell;
+        }
+
         /// stopping 置位后本条提交是否放行: 仅本池 worker 的嵌套提交,
         /// 消耗有限预算(DRAIN_NESTED_BUDGET), 其余一律拒绝.
-        /// 放行依赖的不变式: 调用方(worker)必在执行某个任务体, 而任务体
-        /// 在完成前持有 pending 计数 -> 收敛判据(pending 归零)不可能
-        /// 在派生窗口内静默成立, 在途子节点必被计入或被后续轮次消费
+        /// 放行依赖的不变式: 调用方(worker)必在执行某个任务体, 该任务体
+        /// 的占坑在完成前不被抵消(抵消落在完成时, 见 complete_one), 求和
+        /// 在派生窗口内必 ≥ 1 -> 收敛判据(求和归零)不可能在该窗口内
+        /// 静默成立, 在途子节点必被计入或被后续轮次消费
         [[nodiscard]]
         bool nested_submit_permitted() noexcept {
             if (detail::tls_pool != static_cast<const void*>(this)) {
@@ -847,13 +890,34 @@ namespace concurrent {
             }
         }
 
-        /// 单个任务完成的统一收尾: 计数归零者负责推进空闲代际并唤醒等待者.
-        /// wait()/shutdown(drain) 挂在 idle_gen_ 上, 任何一条完成路径漏掉
-        /// 这一步都会让它们永久沉睡 - 故所有收尾必须收口于此
+        /// 空闲代际推进: 唤醒挂在 idle_gen_ 上的全部等待者(wait / 排空)
+        void bump_idle() const noexcept {
+            idle_gen_.fetch_add(1, std::memory_order_release);
+            idle_gen_.notify_all();
+        }
+
+        /// 全量求和归零则推代际. 误判(瞬时负值 / 未抵消残差)至多是虚假
+        /// 唤醒, 等待方复检; 漏判由唤醒纪律兜底: 完成路径的捷径 +
+        /// worker 睡前无条件检查 + 排空轮次的观察(见 drop_all_queued)
+        void maybe_bump_if_idle() const noexcept {
+            if (pending_count() == 0) {
+                bump_idle();
+            }
+        }
+
+        /// 单个任务完成的统一收尾: 扣减本线程单元的 pending 份额.
+        /// worker 完成不触碰任何共享计数器, 零争用. 归零唤醒走捷径或
+        /// 睡觉路径的兜底检查(见 worker_main), 故所有完成收尾必须收口于此
         void complete_one() noexcept {
-            if ((state_.fetch_sub(PENDING_UNIT, std::memory_order_acq_rel) >> 1) == 1) {
-                idle_gen_.fetch_add(1, std::memory_order_release);
-                idle_gen_.notify_all();
+            cells_->at(cell_of_caller()).value.fetch_sub(1, std::memory_order_acq_rel);
+            // 常态唤醒捷径: 其余 worker 全在睡且队列已空, 本次完成极可能
+            // 就是最后一次 - 直接推代际, 等待者免等满本 worker 的自旋预算.
+            // 启发式可能误判(在途占坑 / 他方本地 deque 漏读), 误判至多
+            // 虚假唤醒; 漏判由睡觉路径的无条件求和兜底
+            const std::uint64_t idle = idle_state_.load(std::memory_order_relaxed);
+            if (spinner_count(idle) == 0 && sleeper_count(idle) == n_threads_ - 1 &&
+                !more_work_hint(detail::tls_worker)) {
+                bump_idle();
             }
         }
 
@@ -905,7 +969,7 @@ namespace concurrent {
         /// 构造中途失败的收尾: 先让已启动的 worker 看到停止信号并唤醒它们,
         /// 再 join, 最后清空节点缓存. 之后异常方可继续传播
         void abort_partial_construction() noexcept {
-            state_.fetch_or(STOPPING_BIT, std::memory_order_acq_rel);
+            stopping_.store(true, std::memory_order_seq_cst);
             quitting_.store(true, std::memory_order_release);
             wake_gen_.fetch_add(1, std::memory_order_release);
             wake_gen_.notify_all();
@@ -992,6 +1056,10 @@ namespace concurrent {
                     execute_node(m, idx);
                     continue;
                 }
+                // 睡前全量求和: 若此刻恰好归零(本人完成最后一次却被
+                // complete_one 的捷径漏判, 或他方自旋者尚未离场), 立即推
+                // 代际 - 等待者最坏只多等一个自旋预算
+                maybe_bump_if_idle();
                 wake_gen_.wait(g); // 全空则睡; 推送方 bump 代际唤醒
                 idle_state_.fetch_sub(SLEEPER_UNIT, std::memory_order_relaxed);
             }
@@ -1069,10 +1137,12 @@ namespace concurrent {
         /// 两轮 - 提交路径为此零开销, 关闭路径多绕几轮即可收敛
         void drop_all_queued() noexcept {
             // 计数必须随销毁同步扣减: 若留到循环之后, "等待计数归零"与
-            // "扣减被销毁节点的计数"互为因果, 将永久自锁
-            auto account_drop = [this](node_t* n) noexcept {
+            // "扣减被销毁节点的计数"互为因果, 将永久自锁. 扣减落本线程
+            // (排空线程)自己的分片, 不与其他线程争用
+            const std::size_t cell = cell_of_caller();
+            auto account_drop = [this, cell](node_t* n) noexcept {
                 abandon(n);
-                complete_one();
+                cells_->at(cell).value.fetch_sub(1, std::memory_order_acq_rel);
             };
 
             int quiet_rounds = 0;
@@ -1097,6 +1167,7 @@ namespace concurrent {
                 // 在途工作(见 enqueue 的占坑 RMW): 置位后不再有新的进入者,
                 // 该计数单调收敛, 两轮静默从而是可达成的
                 if (got == 0 && pending_count() == 0) {
+                    bump_idle(); // 排空归零: 唤醒挂在 idle_gen_ 上的其他等待者
                     ++quiet_rounds;
                 } else {
                     quiet_rounds = 0;
@@ -1155,11 +1226,10 @@ namespace concurrent {
             return PRIORITY ? p : task_priority::normal;
         }
 
-        /// 提交闸门与在途计数合成一个字: bit0 = stopping(拒绝新提交),
-        /// 其余位 = pending(已入队/运行中的工作, 外加"越过检查但尚未入队"的
-        /// 在途提交). 合成之后每次提交只付一次共享行上的 RMW, 关闭与计数的
-        /// 定序也不再需要额外的 Dekker 配对(见 enqueue)
-        alignas(64) mutable std::atomic<std::uint64_t> state_{0};
+        /// 提交闸门: 置位即拒绝新提交(worker 嵌套提交除外, 见 enqueue).
+        /// 与 cells_ 分片求和构成关闭收敛协议: 置位是 seq_cst, 占坑后的
+        /// 复查也是 seq_cst, Dekker 全序保证在途提交必被收敛轮次计入
+        alignas(64) std::atomic<bool> stopping_{false};
         /// 唤醒代际. 取 32 位而非 64: libstdc++ 只对 4 字节对象直接用 futex,
         /// 更宽的类型退化为哈希代理等待池 - 代理下 notify_one 只能保守地
         /// 唤醒全部等待者(惊群), 且不同对象会在池中相互干扰
@@ -1170,7 +1240,7 @@ namespace concurrent {
         /// 判定"是否需要进内核"; 与 worker 侧的"登记 -> 栅栏 -> 复查"构成
         /// 不丢唤醒协议, 详见 notify_wake 与 worker_main 的注释
         alignas(64) std::atomic<std::uint64_t> idle_state_{0};
-        /// worker 的退出判据. 与 state_ 的 stopping 位分离: 后者一置位即
+        /// worker 的退出判据. 与 stopping_ 分离: 后者一置位即
         /// 拒绝新提交, 而 worker 必须继续消费到排空收敛之后才可离场
         alignas(64) std::atomic<bool> quitting_{false};
         alignas(64) std::atomic<std::uint64_t> id_seq_{0};
@@ -1182,6 +1252,15 @@ namespace concurrent {
         std::atomic<std::int64_t> drain_nested_budget_{DRAIN_NESTED_BUDGET};
 
         std::unique_ptr<worker_ctx_t[]> ctxs_;
+        /// pending 记账分片: 每线程一个单元, 占坑 +1 落提交者单元, 完成
+        /// -1 落执行者单元, 全体求和即真实在途数(单元可负). 单元独享
+        /// 缓存行使占坑/完成零争用 - 取代原"单字 state_"的共享行 RMW
+        /// 设计, 后者在 8 生产者饱和下是吞吐瓶颈. 求和是瞬时快照: 依赖
+        /// 缓存传播而非同步链, 可能读到负值或残差, 故归零只作启发,
+        /// 同步依据是唤醒纪律(complete_one 捷径 + worker 睡前检查 +
+        /// 排空观察)与 Dekker 定序的收敛证明. 堆分配以保持池对象本身
+        /// 可安全栈上构造(16 KiB, 同 globals_ 的理由)
+        std::unique_ptr<cells_t> cells_;
         /// 全局空闲节点池(MPMC 有界环): 外部生产者与 worker 之间的节点流转
         /// 复用. 堆分配以保持池对象本身可安全栈上构造(同 globals_)
         std::unique_ptr<node_pool_t> node_pool_;
