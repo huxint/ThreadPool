@@ -8,7 +8,14 @@
 #pragma GCC diagnostic ignored "-Wpedantic"
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include "third_party/BS_thread_pool.hpp"
+#include "third_party/concurrentqueue.h"
 #include <taskflow/taskflow.hpp>
+#ifdef CONCURRENT_BENCH_TBB
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
+#include <tbb/task_group.h>
+#endif
 #pragma GCC diagnostic pop
 
 #include <algorithm>
@@ -23,7 +30,8 @@
 #include <thread>
 #include <vector>
 
-// 同机对比: concurrent::pool vs Taskflow vs BS::thread_pool
+// 同机对比: concurrent::pool vs Taskflow vs BS::thread_pool,
+// 扩展基线: oneTBB(系统包)与 moodycamel 队列自建池
 //
 // 公平性约定:
 // - 同一负载, 同一线程数, 每项取多轮最优
@@ -97,6 +105,46 @@ namespace {
 
     constexpr std::uint64_t LONG_ITERS = 20'000; // 长任务实算量(约数十微秒)
     constexpr std::uint64_t SHORT_ITERS = 100;   // 短任务实算量(亚微秒级)
+
+    // moodycamel 队列 + 标准 CV 唤醒的自建池: 代表"最佳通用无锁队列"这一档.
+    // std::function 与 BS::thread_pool 同档(通用池的惯用路径), 队列才是变量
+    class mcq_pool {
+    public:
+        explicit mcq_pool(std::size_t n) {
+            workers_.reserve(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                workers_.emplace_back([this](std::stop_token st) { run(st); });
+            }
+        }
+        ~mcq_pool() {
+            stop_.store(true, std::memory_order_release);
+            cv_.notify_all();
+        }
+        void enqueue(std::function<void()> f) {
+            q_.enqueue(std::move(f));
+            cv_.notify_one();
+        }
+
+    private:
+        void run(std::stop_token st) {
+            std::function<void()> f;
+            while (!stop_.load(std::memory_order_acquire) && !st.stop_requested()) {
+                if (q_.try_dequeue(f)) {
+                    f();
+                    continue;
+                }
+                std::unique_lock lk{mtx_};
+                cv_.wait_for(lk, std::chrono::microseconds(200), [&] {
+                    return stop_.load(std::memory_order_acquire) || st.stop_requested();
+                });
+            }
+        }
+        moodycamel::ConcurrentQueue<std::function<void()>> q_{};
+        std::mutex mtx_;
+        std::condition_variable cv_;
+        std::atomic<bool> stop_{false};
+        std::vector<std::jthread> workers_;
+    };
 
     // 特性组合吞吐: 以 execute 单生产者为统一负载, 度量各标签组合的调度开销
     template <typename Pool>
@@ -566,6 +614,223 @@ int main(int argc, char** argv) {
             1e3;
         std::println("{:<{}} {:>14.2f}", "parallel_map full run", NAME_W, ours);
     }
+
+    // 扩展基线: oneTBB(系统包)与 moodycamel 队列自建池. 与上面的表同负载
+    // 同线程数, 但独立成表 - 原表的历史口径(两基线三列)保持不变
+
+    section("extended baselines: oneTBB / moodycamel pool");
+#ifdef CONCURRENT_BENCH_TBB
+    {
+        const std::size_t count = 500'000 / scale;
+        const auto mops_of = [&](double secs) { return static_cast<double>(count) / secs / 1e6; };
+        std::println("{:<{}} {:>12} {:>12} {:>12} {:>10}", "case", NAME_W, "oneTBB", "mcq pool",
+                     "ours", "vs best");
+        const auto xrow = [&](std::string_view name, double tbb_m, double mcq_m, double our_m) {
+            const double base = std::max(tbb_m, mcq_m);
+            std::println("{:<{}} {:>12.2f} {:>12.2f} {:>12.2f} {:>8.2f}x", name, NAME_W, tbb_m,
+                         mcq_m, our_m, base > 0 ? our_m / base : 0.0);
+        };
+
+        // 单生产者 fire-and-forget
+        {
+            const double tbb = mops_of(best_seconds(reps, [&] {
+                tbb::task_arena arena(static_cast<int>(threads));
+                std::atomic<std::size_t> n{0};
+                for (std::size_t i = 0; i < count; ++i) {
+                    arena.enqueue([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+                }
+                wait_count(n, count);
+            }));
+            const double mcq = mops_of(best_seconds(reps, [&] {
+                mcq_pool p(threads);
+                std::atomic<std::size_t> n{0};
+                for (std::size_t i = 0; i < count; ++i) {
+                    p.enqueue([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+                }
+                wait_count(n, count);
+            }));
+            const double ours = mops_of(best_seconds(reps, [&] {
+                pool p({.threads = threads});
+                std::atomic<std::size_t> n{0};
+                for (std::size_t i = 0; i < count; ++i) {
+                    static_cast<void>(p.execute([&n]() noexcept {
+                        n.fetch_add(1, std::memory_order_relaxed);
+                    }));
+                }
+                wait_count(n, count);
+            }));
+            xrow("single producer", tbb, mcq, ours);
+        }
+
+        // 8 生产者竞争提交
+        {
+            const std::size_t each = 100'000 / scale;
+            const std::size_t total = 8 * each;
+            const auto mops8 = [&](double secs) { return static_cast<double>(total) / secs / 1e6; };
+            const auto produce_tbb = [&](tbb::task_arena& arena, std::atomic<std::size_t>& n) {
+                for (std::size_t i = 0; i < each; ++i) {
+                    arena.enqueue([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+                }
+            };
+            const auto produce_mcq = [&](mcq_pool& p, std::atomic<std::size_t>& n) {
+                for (std::size_t i = 0; i < each; ++i) {
+                    p.enqueue([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+                }
+            };
+            const auto produce_ours = [&](pool& p, std::atomic<std::size_t>& n) {
+                for (std::size_t i = 0; i < each; ++i) {
+                    static_cast<void>(p.execute([&n]() noexcept {
+                        n.fetch_add(1, std::memory_order_relaxed);
+                    }));
+                }
+            };
+
+            const double tbb = mops8(best_seconds(reps, [&] {
+                tbb::task_arena arena(static_cast<int>(threads));
+                std::atomic<std::size_t> n{0};
+                std::vector<std::jthread> ts;
+                ts.reserve(8);
+                for (int i = 0; i < 8; ++i) {
+                    ts.emplace_back([&] { produce_tbb(arena, n); });
+                }
+                ts.clear();
+                wait_count(n, total);
+            }));
+            const double mcq = mops8(best_seconds(reps, [&] {
+                mcq_pool p(threads);
+                std::atomic<std::size_t> n{0};
+                std::vector<std::jthread> ts;
+                ts.reserve(8);
+                for (int i = 0; i < 8; ++i) {
+                    ts.emplace_back([&] { produce_mcq(p, n); });
+                }
+                ts.clear();
+                wait_count(n, total);
+            }));
+            const double ours = mops8(best_seconds(reps, [&] {
+                pool p({.threads = threads});
+                std::atomic<std::size_t> n{0};
+                std::vector<std::jthread> ts;
+                ts.reserve(8);
+                for (int i = 0; i < 8; ++i) {
+                    ts.emplace_back([&] { produce_ours(p, n); });
+                }
+                ts.clear();
+                wait_count(n, total);
+            }));
+            xrow("8 producers", tbb, mcq, ours);
+        }
+
+        // 递归 fork-join
+        {
+            const std::size_t depth = quick ? 14 : 18;
+            const std::size_t leaves_expect = std::size_t{1} << depth;
+            const auto mopsl = [&](double secs) {
+                return static_cast<double>(leaves_expect) / secs / 1e6;
+            };
+            struct mcq_fork {
+                static void go(mcq_pool& p, std::atomic<std::size_t>& leaves, std::size_t d) {
+                    if (d == 0) {
+                        leaves.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    for (int i = 0; i < 2; ++i) {
+                        p.enqueue([&p, &leaves, d] { go(p, leaves, d - 1); });
+                    }
+                }
+            };
+            const double tbb = mopsl(best_seconds(reps, [&] {
+                tbb::task_arena arena(static_cast<int>(threads));
+                std::atomic<std::size_t> leaves{0};
+                arena.execute([&] {
+                    tbb::task_group tg;
+                    auto go = [&](auto&& self, std::size_t d) -> void {
+                        if (d == 0) {
+                            leaves.fetch_add(1, std::memory_order_relaxed);
+                            return;
+                        }
+                        tg.run([&, d] { self(self, d - 1); });
+                        self(self, d - 1);
+                    };
+                    go(go, depth);
+                    tg.wait();
+                });
+                wait_count(leaves, leaves_expect);
+            }));
+            const double mcq = mopsl(best_seconds(reps, [&] {
+                mcq_pool p(threads);
+                std::atomic<std::size_t> leaves{0};
+                mcq_fork::go(p, leaves, depth);
+                wait_count(leaves, leaves_expect);
+            }));
+            const double ours = mopsl(best_seconds(reps, [&] {
+                pool p({.threads = threads});
+                std::atomic<std::size_t> leaves{0};
+                auto go = [&](auto&& self, std::size_t d) -> void {
+                    if (d == 0) {
+                        leaves.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    for (int i = 0; i < 2; ++i) {
+                        static_cast<void>(
+                            p.execute([&, d]() noexcept { self(self, d - 1); }));
+                    }
+                };
+                go(go, depth);
+                wait_count(leaves, leaves_expect);
+            }));
+            xrow(std::format("binary split depth {}", depth), tbb, mcq, ours);
+        }
+    }
+
+    // 分块并行映射: TBB parallel_for 与本库 chunked 入口同 grain 同负载.
+    // 结果经 volatile 汇聚: 直接内联的循环会被 DCE 整段删除(实测出现过
+    // 0.00ms 的假数), volatile 写入强制实算留存
+    {
+        std::vector<std::uint64_t> data(quick ? 64 : 512, LONG_ITERS);
+        std::println("{:<{}} {:>12} {:>12} {:>10}", "case (ms)", NAME_W, "oneTBB", "ours",
+                     "vs TBB");
+        volatile double sink = 0;
+        const double tbb = best_seconds(reps,
+                                        [&] {
+                                            tbb::task_arena arena(static_cast<int>(threads));
+                                            arena.execute([&] {
+                                                tbb::parallel_for(
+                                                    tbb::blocked_range<std::size_t>(0, data.size(),
+                                                                                    64),
+                                                    [&](const tbb::blocked_range<std::size_t>& r) {
+                                                        double acc = 0;
+                                                        for (std::size_t i = r.begin();
+                                                             i != r.end(); ++i) {
+                                                            acc += spin_work(data[i]);
+                                                        }
+                                                        sink += acc;
+                                                    });
+                                            });
+                                        }) *
+                           1e3;
+        const double ours = best_seconds(reps,
+                                         [&] {
+                                             pool p({.threads = threads});
+                                             auto v = concurrent::parallel_map_chunked(
+                                                 p, data,
+                                                 [sink_ptr = &sink](auto&& chunk) {
+                                                     double acc = 0;
+                                                     for (auto k : chunk) {
+                                                         acc += spin_work(k);
+                                                     }
+                                                     *sink_ptr += acc;
+                                                 },
+                                                 64);
+                                             static_cast<void>(v.run());
+                                         }) *
+                            1e3;
+        std::println("{:<{}} {:>12.2f} {:>12.2f} {:>8.2f}x", "parallel map x64 chunks", NAME_W,
+                     tbb, ours, tbb > 0 ? ours / tbb : 0.0);
+    }
+#else
+    std::println("oneTBB not found - install onetbb to enable the extended comparison");
+#endif
 
     std::println("\nnote: ratio is relative to \"best baseline\" - throughput = ours/best,"
                  " time = best/ours");

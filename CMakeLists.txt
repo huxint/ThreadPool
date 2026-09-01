@@ -55,6 +55,13 @@ target_link_libraries(concurrent_bench PRIVATE concurrent)
 target_include_directories(concurrent_bench PRIVATE benchmarks benchmarks/third_party/taskflow_repo)
 concurrent_own_compile_options(concurrent_bench)
 
+# oneTBB: 系统包引入(未随仓库分发), 未找到时跳过 TBB 对比行
+find_package(TBB CONFIG QUIET)
+if(TBB_FOUND)
+    target_link_libraries(concurrent_bench PRIVATE TBB::tbb)
+    target_compile_definitions(concurrent_bench PRIVATE CONCURRENT_BENCH_TBB=1)
+endif()
+
 # -DBUILD_MODULE=ON: module wrapper `concurrent.pool` (requires Ninja)
 option(BUILD_MODULE "build the concurrent.pool module wrapper" OFF)
 if(BUILD_MODULE)
