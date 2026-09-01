@@ -292,6 +292,26 @@ TEST_SUITE("concurrent.task") {
         t.request_stop(); // 不得崩溃
     }
 
+    // 回归: "结果恰好可取一次"对 task<void> 同样成立. void 没有值可搬走,
+    // 若只以"值已被取走"判定消费, 再次 get() 会一路返回成功, 与 task<T> 分叉
+    TEST_CASE("second_get_reports_invalid_task_for_void_and_value_tasks") {
+        pool p({.threads = 2});
+
+        auto v = p.submit([] {});
+        REQUIRE(v.has_value());
+        CHECK(v->get().has_value());
+        auto v2 = v->get();
+        REQUIRE(!v2.has_value());
+        CHECK(is_invalid_task(v2.error()));
+
+        auto i = p.submit([] { return 42; });
+        REQUIRE(i.has_value());
+        CHECK(i->get().value_or(0) == 42);
+        auto i2 = i->get();
+        REQUIRE(!i2.has_value());
+        CHECK(is_invalid_task(i2.error()));
+    }
+
     // 回归: 组合子必须在空共享状态上短路, 而非解引用空指针
     TEST_CASE("combinators_shortcircuit_on_invalid_task") {
         task<int> t;

@@ -1,5 +1,6 @@
 #pragma once
 #include "concurrent/detail/chase_lev.hpp"
+#include "concurrent/detail/contract_assert.hpp"
 #include "concurrent/detail/cpu_relax.hpp"
 #include "concurrent/detail/global_queue.hpp"
 #include "concurrent/detail/mpmc_ring.hpp"
@@ -29,9 +30,14 @@ namespace concurrent {
 
     /// 关闭策略
     enum class shutdown_policy : std::uint8_t {
-        drain,   ///< 排空全部排队任务后退出(析构默认)
-        discard, ///< 丢弃排队任务并以取消语义终结其结果通道; 运行中任务两种
-                 ///  策略下都会等待完成(jthread join 的固有语义)
+        drain, ///< 排空全部排队任务后退出(析构默认)
+        /// 丢弃排队任务并以取消语义终结其结果通道; 运行中任务两种策略下
+        /// 都会等待完成(jthread join 的固有语义). 时序上的精确保证: 被
+        /// drop_all_queued 收敛的任务必不执行, 且结果通道必以
+        /// operation_cancelled 终结; 但停止位与排空之间存在竞争窗口, worker
+        /// 已从队列取出而尚未开跑的那部分可能照常执行(任务体不在该窗口内
+        /// 被取消). 故"丢弃"应读作"尽力丢弃", 不可依赖"排队即绝不执行"
+        discard,
     };
 
     namespace detail {
@@ -391,7 +397,10 @@ namespace concurrent {
         }
 
         /// 阻塞直至全部任务完成(排队 + 运行中). 虚假唤醒安全
+        /// @pre 调用者不得是本池的 worker - 其正在执行的任务自身就持有
+        ///      pending 计数, 归零永不发生, 必死锁(Debug 构建下契约断言终止)
         void wait() const noexcept {
+            CONCURRENT_CONTRACT_ASSERT(!in_own_worker());
             while (pending_count() != 0) {
                 std::uint32_t g = idle_gen_.load(std::memory_order_acquire);
                 if (pending_count() == 0) {
@@ -431,7 +440,10 @@ namespace concurrent {
         /// 派生被放行(有限预算, 见 DRAIN_NESTED_BUDGET), 在途计算树得以
         /// 整体完成而非中途断链. 可并发调用: 首个调用者的 policy 生效, 其余
         /// 调用者阻塞至拆除完成后做一次空收敛
+        /// @pre 调用者不得是本池的 worker - join 自身 + 等自身完成的 pending
+        ///      归零, 必死锁(Debug 构建下契约断言终止)
         void shutdown(shutdown_policy policy = shutdown_policy::drain) noexcept {
+            CONCURRENT_CONTRACT_ASSERT(!in_own_worker());
             // 与 enqueue 的占坑 RMW 同处一个字: 修改序全序保证"置位之前占坑
             // 成功"的在途提交必被收敛轮次看到(见 enqueue)
             const bool first = (state_.fetch_or(STOPPING_BIT, std::memory_order_acq_rel) &
@@ -728,6 +740,13 @@ namespace concurrent {
             // 外部提交或本地溢出: 全局队列(环满自动落入溢出链, 永不失败, 永不阻塞)
             (*globals_)[level].push(node);
             return {};
+        }
+
+        /// 调用者是否本池的 worker. 供 wait / shutdown 的前置契约使用:
+        /// 这两者由 worker 调用必死锁(见各自 @pre)
+        [[nodiscard]]
+        bool in_own_worker() const noexcept {
+            return detail::tls_pool == static_cast<const void*>(this);
         }
 
         /// stopping 置位后本条提交是否放行: 仅本池 worker 的嵌套提交,

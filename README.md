@@ -154,8 +154,8 @@ task 组合子(均在完成任务的工作线程上内联执行, 结果值恰好
 | `parallel_map_chunked(p, range, f, grain)` | 分块版: 每 grain 个元素一块(0 = 按线程数), `f` 对每块调用一次并接收子区间; 大区间优先用此入口 |
 | `parallel_for(p, range, f).run()` | 同上, 无返回值版; `.run()` 直接执行并返回首个错误 |
 | `parallel_view::results()` | 结果流: 单趟 `std::generator`, 可直接组合 ranges 管道(如 `v.results() \| std::views::take(3)`) |
-| `p.wait()` / `wait_for` / `wait_until` | 阻塞至全部完成 / 超时变体 |
-| `p.shutdown(policy)` | `drain` 排空后退出(析构默认); `discard` 丢弃排队任务并以取消语义终结其结果通道; 运行中任务两者都会等待完成(join 固有语义); 两者均放行 worker 内嵌套提交(fork-join 析构安全) |
+| `p.wait()` / `wait_for` / `wait_until` | 阻塞至全部完成 / 超时变体. 不得在任务体(worker 线程)内调用 `wait`/`shutdown` - 必死锁, Debug 构建下契约断言终止 |
+| `p.shutdown(policy)` | `drain` 排空后退出(析构默认); `discard` 尽力丢弃排队任务并以取消语义终结其结果通道(worker 已取出未开跑的部分可能照常执行); 运行中任务两者都会等待完成(join 固有语义); 两者均放行 worker 内嵌套提交(fork-join 析构安全) |
 
 错误辨识: `is_cancelled(e)` 判取消, `is_invalid_task(e)` 判无效任务句柄, `submit_error_of(e)` 还原提交阶段失败
 

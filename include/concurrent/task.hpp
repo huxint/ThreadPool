@@ -377,11 +377,19 @@ namespace concurrent {
             }
 
             /// 取走结果. invalid_task 标记表示结果已被消费
+            ///
+            /// 消费判定不能只看 has_value_: task<void> 没有值可搬走, 单凭那个
+            /// 标志"再次 get" 会照常返回成功, 与 task<T> 的语义分叉. 独立的
+            /// consumed_ 让两者一致, 顺带把"两份句柄并发 get"从对 has_value_
+            /// 的数据竞争收敛成一次原子交换
             [[nodiscard]]
             std::expected<T, std::exception_ptr> take_result() {
                 wait_done();
                 if (exc_) {
                     return std::unexpected(exc_);
+                }
+                if (consumed_.exchange(true, std::memory_order_relaxed)) {
+                    return std::unexpected(invalid_task_error());
                 }
                 if constexpr (!std::is_void_v<T>) {
                     if (!has_value_) {
@@ -406,6 +414,9 @@ namespace concurrent {
             mutable std::atomic<std::uint32_t> waiters_{0};
             std::stop_source source_{std::nostopstate};
             std::atomic<bool> stop_{false};
+            /// take_result 的一次性闸门(见其注释). 紧挨 stop_ 摆放是为了落进
+            /// exc_ 的对齐填充里 - 换到别处会把状态整体撑大一个字
+            std::atomic<bool> consumed_{false};
             std::exception_ptr exc_ = nullptr;
             [[no_unique_address]]
             typename value_storage<T>::type value_{};
