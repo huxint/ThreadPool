@@ -75,8 +75,12 @@ namespace concurrent {
      * worker 内嵌套提交进本地, 本地溢出落全局; 全局环满则转入同序溢出链,
      * 提交永不阻塞, 永不拒绝
      *
-     * 零 throw: 一切失败经 std::expected 报告; 任务体异常被捕获并透传至结果通道;
-     * execute 要求 callable 为 noexcept - 从类型系统保证遗忘型任务零异常逃逸
+     * 零 throw: 库自身的一切失败经 std::expected 报告; 任务体异常被捕获并透传至
+     * 结果通道; execute 要求 callable 为 noexcept - 从类型系统保证遗忘型任务零
+     * 异常逃逸(连带排斥了拷贝构造会抛的实参). 唯一的例外是 submit / submit_each
+     * 在提交期运行的**用户代码** - callable 与实参的拷贝/移动构造: 其中的
+     * bad_alloc 折成 submit_error::out_of_memory, 其余异常原样透传给调用方
+     * (误标为 OOM 反而丢失了真实成因)
      *
      * 取消: 每个任务状态都带取消标志, 未开跑即取消的任务体被跳过并标记
      * operation_cancelled; 真正的 stop_source 仅在 callable 轮询 token 时实体化
@@ -101,7 +105,7 @@ namespace concurrent {
         /// 本地 deque / 全局环每层容量, queue_cap<Global, Local> 标签可配(2 的幂).
         /// 环满自动落入保序溢出链(不拒绝不阻塞), 故容量只影响内存占用与
         /// 无锁快路径占比, 不影响正确性; 大环吸收多生产者积压, 避免溢出链
-        /// 自旋锁争用. 缺省 256 / 65536
+        /// 自旋锁争用(实测降到 8192 会让 8 生产者吞吐掉一半). 缺省 65536 / 256
         static constexpr std::size_t LOCAL_CAP = detail::queue_local_cap_v<Flags...>;
         static constexpr std::size_t GLOBAL_CAP = detail::queue_global_cap_v<Flags...>;
         static_assert(std::has_single_bit(GLOBAL_CAP),
@@ -184,13 +188,15 @@ namespace concurrent {
                 n_threads_ = std::min(n_threads_, WORKER_CAP);
             }
 
+            // 队列先于 worker 就位, 且置于 try 之外: 收尾路径(flush_freelists)
+            // 要解引用 node_pool_, 只有 worker 已启动的失败才需要那条路径
             ctxs_ = std::make_unique<worker_ctx_t[]>(n_threads_);
             for (std::size_t i = 0; i < n_threads_; ++i) {
                 ctxs_[i].index = i;
             }
+            node_pool_ = std::make_unique<node_pool_t>();
+            globals_ = std::make_unique<std::array<gq_t, LEVELS>>();
             try {
-                node_pool_ = std::make_unique<node_pool_t>();
-                globals_ = std::make_unique<std::array<gq_t, LEVELS>>();
                 spawn_workers();
             } catch (...) {
                 // 已就位的 worker 只在看到停止信号后才退出循环; 若跳过这步,
@@ -227,6 +233,9 @@ namespace concurrent {
          *
          * callable 可接受 `const std::stop_token&` 首参以获得协作取消能力;
          * 返回的 task 携带 request_stop(). 结果值恰好可取一次
+         *
+         * @throws 提交期由**用户代码**(callable 与实参的拷贝/移动构造)抛出的
+         *         非 bad_alloc 异常原样透传; bad_alloc 折成 out_of_memory
          */
         template <typename F, typename... Args>
             requires(!std::same_as<std::remove_cvref_t<F>, task_priority>) &&
@@ -236,12 +245,10 @@ namespace concurrent {
         auto submit(F&& f, Args&&... args)
             -> std::expected<task<detail::submit_result_t<F, Args...>>, submit_error> {
             using R = detail::submit_result_t<F, Args...>;
-            try {
+            return guard_oom([&] {
                 return submit_impl<R>(task_priority::normal, std::forward<F>(f),
                                       std::forward<Args>(args)...);
-            } catch (const std::bad_alloc&) {
-                return std::unexpected(submit_error::out_of_memory);
-            }
+            });
         }
 
         /// 提交带优先级的任务 @requires priority 标签
@@ -252,11 +259,9 @@ namespace concurrent {
         auto submit(task_priority prio, F&& f, Args&&... args)
             -> std::expected<task<detail::submit_result_t<F, Args...>>, submit_error> {
             using R = detail::submit_result_t<F, Args...>;
-            try {
+            return guard_oom([&] {
                 return submit_impl<R>(prio, std::forward<F>(f), std::forward<Args>(args)...);
-            } catch (const std::bad_alloc&) {
-                return std::unexpected(submit_error::out_of_memory);
-            }
+            });
         }
 
         /**
@@ -315,8 +320,7 @@ namespace concurrent {
 
             // 阶段二: 依序入队, 单次唤醒
             for (std::size_t i = 0; i < staged.size(); ++i) {
-                auto ok = enqueue(static_cast<int>(level_of(task_priority::normal)),
-                                  staged[i]);
+                auto ok = enqueue(level_of(task_priority::normal), staged[i]);
                 if (!ok) {
                     for (++i; i < staged.size(); ++i) {
                         abandon(staged[i]); // 从未入队: 终结后销毁
@@ -342,12 +346,10 @@ namespace concurrent {
             requires(std::is_nothrow_invocable_v<F, Args...>)
         [[nodiscard]]
         std::expected<void, submit_error> execute(F&& f, Args&&... args) {
-            try {
+            return guard_oom([&] {
                 return execute_impl(task_priority::normal, std::forward<F>(f),
                                     std::forward<Args>(args)...);
-            } catch (const std::bad_alloc&) {
-                return std::unexpected(submit_error::out_of_memory);
-            }
+            });
         }
 
         /// 即发即忘 + 优先级 @requires priority 标签
@@ -355,11 +357,8 @@ namespace concurrent {
             requires(PRIORITY && std::is_nothrow_invocable_v<F, Args...>)
         [[nodiscard]]
         std::expected<void, submit_error> execute(task_priority prio, F&& f, Args&&... args) {
-            try {
-                return execute_impl(prio, std::forward<F>(f), std::forward<Args>(args)...);
-            } catch (const std::bad_alloc&) {
-                return std::unexpected(submit_error::out_of_memory);
-            }
+            return guard_oom(
+                [&] { return execute_impl(prio, std::forward<F>(f), std::forward<Args>(args)...); });
         }
 
         /// 可取消的即发即忘执行, 返回取消源 @requires cancellable 标签
@@ -371,12 +370,10 @@ namespace concurrent {
                      !std::is_nothrow_invocable_v<F, Args...>)
         [[nodiscard]]
         std::expected<std::stop_source, submit_error> execute(F&& f, Args&&... args) {
-            try {
+            return guard_oom([&] {
                 return execute_cancellable_impl(task_priority::normal, std::forward<F>(f),
                                                 std::forward<Args>(args)...);
-            } catch (const std::bad_alloc&) {
-                return std::unexpected(submit_error::out_of_memory);
-            }
+            });
         }
 
         /// 可取消 + 优先级 @requires priority 与 cancellable 标签
@@ -387,12 +384,10 @@ namespace concurrent {
         [[nodiscard]]
         std::expected<std::stop_source, submit_error> execute(task_priority prio, F&& f,
                                                               Args&&... args) {
-            try {
+            return guard_oom([&] {
                 return execute_cancellable_impl(prio, std::forward<F>(f),
                                                 std::forward<Args>(args)...);
-            } catch (const std::bad_alloc&) {
-                return std::unexpected(submit_error::out_of_memory);
-            }
+            });
         }
 
         /// 阻塞直至全部任务完成(排队 + 运行中). 虚假唤醒安全
@@ -469,6 +464,19 @@ namespace concurrent {
         }
 
     private:
+        /// submit / execute 的公共外壳: 提交路径唯一允许逃逸的异常是分配
+        /// 失败, 就地转入 expected 的错误通道(库表面零 throw). 其余异常
+        /// (F 与实参的拷贝/移动)属用户代码, 原样透传
+        template <typename Impl>
+        [[nodiscard]]
+        static auto guard_oom(Impl&& impl) -> decltype(impl()) {
+            try {
+                return impl();
+            } catch (const std::bad_alloc&) {
+                return std::unexpected(submit_error::out_of_memory);
+            }
+        }
+
         /// trace 专用捕获(任务编号 + 优先级). 标签关闭时折叠为 monostate,
         /// 任务闭包除 self/实参之外零固定开销, SBO 预算全部留给用户捕获
         struct trace_env {
@@ -484,6 +492,46 @@ namespace concurrent {
                 return trace_env{.id = id, .prio = prio};
             } else {
                 return {};
+            }
+        }
+
+        /// 取一个节点并把任务闭包就地构造在它的槽里: 免去"先建临时再移动
+        /// 进来"的一次移动构造 + 析构. 构建(F/实参拷贝, sbo_function 堆模式
+        /// 分配)是三条提交路径唯一可能抛的用户代码段, 抛出时节点仍是干净
+        /// 空壳, 原样归还
+        /// @return 空 = 仅因 bad_alloc(节点耗尽); 其余异常原样传播
+        template <typename Factory>
+        node_t* make_node(Factory&& make) {
+            node_t* node = acquire_node();
+            if (!node) [[unlikely]] {
+                return nullptr;
+            }
+            try {
+                node->body.emplace_with(std::forward<Factory>(make));
+            } catch (...) {
+                release_node(node);
+                throw;
+            }
+            return node;
+        }
+
+        /// 提交路径的收尾: 入队 + 唤醒 + trace
+        std::expected<void, submit_error> emit(node_t* node, task_priority prio,
+                                               std::uint64_t id) noexcept {
+            if (auto ok = route(level_of(prio), node); !ok) {
+                return ok;
+            }
+            trace_enqueue(id, prio);
+            return {};
+        }
+
+        /// trace 关闭时零开销: 不触碰 id_seq_
+        [[nodiscard]]
+        std::uint64_t next_trace_id() noexcept {
+            if constexpr (TRACE) {
+                return id_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+            } else {
+                return 0;
             }
         }
 
@@ -505,35 +553,24 @@ namespace concurrent {
                 return nullptr;
             }
 
-            if constexpr (TRACE) {
-                st->id = next_id();
-            }
+            st->id = next_trace_id();
             auto* self = this;
             const trace_env_t env = make_trace_env(st->id, prio);
 
-            node_t* node = acquire_node();
+            node_t* node = make_node([&] {
+                return [st, self, env, f = std::forward<F>(f),
+                        ... a = std::forward<Args>(args)]() mutable noexcept {
+                    self->run_task_body(*st, env, [&]() -> R {
+                        if constexpr (detail::takes_token_v<F, Args...>) {
+                            return std::invoke(std::move(f), st->get_token(), std::move(a)...);
+                        } else {
+                            return std::invoke(std::move(f), std::move(a)...);
+                        }
+                    });
+                };
+            });
             if (!node) [[unlikely]] {
                 return nullptr; // st 随作用域释放
-            }
-            // 闭包就地构造在节点的槽里: 免去一次移动构造 + 析构. 构建
-            // (F/实参拷贝, sbo_function 堆模式分配)是本函数唯一可能抛的
-            // 用户代码段, 抛出时节点仍是干净空壳, 原样归还即可
-            try {
-                node->body.emplace_with([&] {
-                    return [st, self, env, f = std::forward<F>(f),
-                            ... a = std::forward<Args>(args)]() mutable noexcept {
-                        self->run_task_body(*st, env, [&]() -> R {
-                            if constexpr (detail::takes_token_v<F, Args...>) {
-                                return std::invoke(std::move(f), st->get_token(), std::move(a)...);
-                            } else {
-                                return std::invoke(std::move(f), std::move(a)...);
-                            }
-                        });
-                    };
-                });
-            } catch (...) { // 构造期异常原样传播(见 build_submit_node @return)
-                release_node(node);
-                throw;
             }
 
             // 关闭丢弃路径的终结钩子: 以取消语义收尾共享状态并发布完成,
@@ -555,54 +592,35 @@ namespace concurrent {
             if (!node) [[unlikely]] {
                 return std::unexpected(submit_error::out_of_memory);
             }
-
-            if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
+            if (auto ok = emit(node, prio, st->id); !ok) {
                 return std::unexpected(ok.error());
             }
-
-            trace_enqueue(st->id, prio);
             return task<R>{std::move(st)};
         }
 
         template <typename F, typename... Args>
         std::expected<void, submit_error> execute_impl(task_priority prio, F&& f, Args&&... args) {
             auto* self = this;
-            std::uint64_t id = 0;
-            if constexpr (TRACE) {
-                id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
-            }
+            const std::uint64_t id = next_trace_id();
             const trace_env_t env = make_trace_env(id, prio);
 
-            node_t* node = acquire_node();
+            node_t* node = make_node([&] {
+                return [self, env, f = std::forward<F>(f),
+                        ... a = std::forward<Args>(args)]() mutable noexcept {
+                    if constexpr (TRACE) {
+                        self->trace_begin(env.id, env.prio);
+                    }
+                    std::invoke(std::move(f), std::move(a)...); // noexcept 由 concepts 强制
+                    if constexpr (TRACE) {
+                        self->trace_end(env.id, env.prio, outcome_kind::completed);
+                    }
+                    self->complete_one();
+                };
+            });
             if (!node) [[unlikely]] {
                 return std::unexpected(submit_error::out_of_memory);
             }
-            // 同 build_submit_node: 闭包就地构造, 构建失败原样归还节点
-            try {
-                node->body.emplace_with([&] {
-                    return [self, env, f = std::forward<F>(f),
-                            ... a = std::forward<Args>(args)]() mutable noexcept {
-                        if constexpr (TRACE) {
-                            self->trace_begin(env.id, env.prio);
-                        }
-                        std::invoke(std::move(f), std::move(a)...); // noexcept 由 concepts 强制
-                        if constexpr (TRACE) {
-                            self->trace_end(env.id, env.prio, outcome_kind::completed);
-                        }
-                        self->complete_one();
-                    };
-                });
-            } catch (...) {
-                release_node(node);
-                throw;
-            }
-
-            if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
-                return std::unexpected(ok.error());
-            }
-
-            trace_enqueue(id, prio);
-            return {};
+            return emit(node, prio, id);
         }
 
         template <typename F, typename... Args>
@@ -611,47 +629,32 @@ namespace concurrent {
             // 取消源生命周期随闭包: 调用方句柄失效后任务仍可安全查询
             auto source = std::make_shared<std::stop_source>();
             auto* self = this;
-            std::uint64_t id = 0;
-            if constexpr (TRACE) {
-                id = next_id(); // trace 关闭时零开销: 不触碰 id_seq_
-            }
+            const std::uint64_t id = next_trace_id();
             const trace_env_t env = make_trace_env(id, prio);
 
-            node_t* node = acquire_node();
+            node_t* node = make_node([&] {
+                return [self, env, source, f = std::forward<F>(f),
+                        ... a = std::forward<Args>(args)]() mutable noexcept {
+                    if constexpr (TRACE) {
+                        self->trace_begin(env.id, env.prio);
+                    }
+                    if (!source->stop_requested()) {
+                        std::invoke(std::move(f), source->get_token(), std::move(a)...);
+                        if constexpr (TRACE) {
+                            self->trace_end(env.id, env.prio, outcome_kind::completed);
+                        }
+                    } else if constexpr (TRACE) {
+                        self->trace_end(env.id, env.prio, outcome_kind::cancelled);
+                    }
+                    self->complete_one();
+                };
+            });
             if (!node) [[unlikely]] {
                 return std::unexpected(submit_error::out_of_memory);
             }
-            // 同上面两条提交路径: 闭包就地构造, 构建失败原样归还节点
-            try {
-                node->body.emplace_with([&] {
-                    return [self, env, source, f = std::forward<F>(f),
-                            ... a = std::forward<Args>(args)]() mutable noexcept {
-                        if constexpr (TRACE) {
-                            self->trace_begin(env.id, env.prio);
-                        }
-                        if (!source->stop_requested()) {
-                            std::invoke(std::move(f), source->get_token(), std::move(a)...);
-                            if constexpr (TRACE) {
-                                self->trace_end(env.id, env.prio, outcome_kind::completed);
-                            }
-                        } else {
-                            if constexpr (TRACE) {
-                                self->trace_end(env.id, env.prio, outcome_kind::cancelled);
-                            }
-                        }
-                        self->complete_one();
-                    };
-                });
-            } catch (...) {
-                release_node(node);
-                throw;
-            }
-
-            if (auto ok = route(static_cast<int>(level_of(prio)), node); !ok) {
+            if (auto ok = emit(node, prio, id); !ok) {
                 return std::unexpected(ok.error());
             }
-
-            trace_enqueue(id, prio);
             return *source; // 拷贝句柄与闭包共享同一停止状态; 不可 move(move
                             // 会掏空闭包持有的源)
         }
@@ -1103,11 +1106,6 @@ namespace concurrent {
             }
         }
 
-        [[nodiscard]]
-        std::uint64_t next_id() noexcept {
-            return id_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
-        }
-
         void trace_enqueue(std::uint64_t id, task_priority p) noexcept {
             if constexpr (TRACE) {
                 if (hooks_.on_enqueue) {
@@ -1171,7 +1169,7 @@ namespace concurrent {
         std::conditional_t<WORKER_CAP != 0, std::inplace_vector<std::jthread, WORKER_CAP>,
                            std::vector<std::jthread>>
             workers_;
-        /// 全局环体积随容量线性增长(65536 槽 ≈ 4MiB/层, priority 下三层),
+        /// 全局环体积随容量线性增长(65536 槽 = 4MiB/层, priority 下三层),
         /// 堆分配以保持池对象本身可安全栈上构造; 热路径仅多一次指针解引用
         std::unique_ptr<std::array<gq_t, LEVELS>> globals_;
         /// !TRACE 时零尺寸(monostate + [[no_unique_address]]), 三个

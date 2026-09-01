@@ -25,7 +25,11 @@ namespace concurrent {
         template <std::size_t Global, std::size_t Local>
         struct queue_cap_flag {};
 
-        /// queue_cap 标签的缺省容量
+        /// queue_cap 标签的缺省容量. 全局环每槽按缓存行填充, 故容量直接
+        /// 决定池的常驻内存(每层 Global x 64B): 65536 槽 = 4 MiB/层.
+        /// 这是拿内存换吞吐 - 实测降到 8192 后 8 生产者场景积压溢出环,
+        /// 落到自旋锁保护的溢出链上, 吞吐掉一半以上. 内存敏感的部署
+        /// 可用 queue_cap<N> 自行下调, 正确性不受影响
         inline constexpr std::size_t queue_cap_default_global = 65536;
         inline constexpr std::size_t queue_cap_default_local = 256;
     } // namespace detail

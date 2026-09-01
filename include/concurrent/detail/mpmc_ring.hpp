@@ -84,6 +84,10 @@ namespace concurrent::detail {
         }
 
     private:
+        /// 槽按缓存行填充: 相邻槽由不同生产者同时写入(tail_ 递增即分发相邻
+        /// 位置), 密排时一行内四个槽的写入互相失效. 实测 8 生产者吞吐差约
+        /// 8%. 代价是环体积四倍, 池的常驻内存因此由容量直接决定
+        /// (见 queue_cap 缺省值的取舍)
         struct alignas(64) cell {
             std::atomic<std::intptr_t> seq;
             T value{};

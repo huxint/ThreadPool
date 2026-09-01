@@ -69,7 +69,7 @@ C++26 高性能线程池: 工作窃取调度 + 无锁队列 + 函数式任务组
 | 特性 | 说明 |
 |------|------|
 | 工作窃取调度 | 每线程本地 deque(LIFO) + Chase-Lev 窃取(FIFO); 全局侧 Vyukov MPMC 环 + 保序溢出链兜底, 提交永不阻塞, 永不拒绝 |
-| 零 throw 契约 | 提交失败经 `std::expected` 报告; 任务体异常透传至结果通道; `execute` 编译期强制 `noexcept` |
+| 零 throw 契约 | 库自身的失败经 `std::expected` 报告; 任务体异常透传至结果通道; `execute` 编译期强制 `noexcept`. 仅 `submit`/`submit_each` 提交期的用户代码(callable 与实参的拷贝构造)异常原样透传 |
 | 函数式组合子 | `task` 支持 `map` / `and_then` / `inspect`, `when_all` 汇合多任务为 `task<tuple<...>>`; 续延链深度守卫, 万级链不爆栈 |
 | 惰性批量 | `parallel_map` / `parallel_for` 返回轻量视图, 首次迭代整批入队, 按输入顺序取回 `expected`; 迭代面经 `std::generator`, `results()` 可直接组合 ranges 管道 |
 | 分块批量 | `parallel_map_chunked` / `parallel_for_chunked` 每块一任务, 摊薄元素级调度开销, 缓解大区间整批提交的内存尖峰 |
@@ -169,7 +169,7 @@ task 组合子(均在完成任务的工作线程上内联执行, 结果值恰好
 | `cancellable` | 解锁返回 `stop_source` 的 execute 重载 |
 | `trace` | 运行期钩子 `on_enqueue` / `on_begin` / `on_end`(签名强制 `noexcept`), 事件含 id/phase/outcome/priority/worker |
 | `worker_cap<N>` | workers 以 `inplace_vector<jthread, N>` 静态存储, 无标签用 `vector` |
-| `queue_cap<Global, Local>` | 全局环 / 本地 deque 容量(2 的幂, 缺省 65536 / 256). 环满自动落入保序溢出链, 容量影响内存占用与无锁快路径占比; 大环吸收多生产者积压避免溢出链争用 |
+| `queue_cap<Global, Local>` | 全局环 / 本地 deque 容量(2 的幂, 缺省 65536 / 256). 环满自动落入保序溢出链, 容量影响内存占用与无锁快路径占比; 大环吸收多生产者积压避免溢出链争用(每槽按缓存行填充, 65536 槽 = 4 MiB/层, 内存敏感时可下调) |
 
 运行期配置 `pool::options`:
 

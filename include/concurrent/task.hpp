@@ -38,22 +38,37 @@ namespace concurrent {
         return std::make_exception_ptr(invalid_task{});
     }
 
+    namespace detail {
+        /// 错误通道的类型判别. 零 throw 契约允许库内 catch - 异常不外泄
+        template <typename E>
+        [[nodiscard]]
+        bool error_is(const std::exception_ptr& e) noexcept {
+            if (!e) {
+                return false;
+            }
+            try {
+                std::rethrow_exception(e);
+            } catch (const E&) {
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+    } // namespace detail
+
     /// 该错误是否表示任务句柄无效(默认构造 / 结果已被消费)
     [[nodiscard]]
     inline bool is_invalid_task(const std::exception_ptr& e) noexcept {
-        if (!e) {
-            return false;
-        }
-        try {
-            std::rethrow_exception(e);
-        } catch (const invalid_task&) {
-            return true;
-        } catch (...) {
-            return false;
-        }
+        return detail::error_is<invalid_task>(e);
     }
 
-    /// 从错误通道辨识"提交阶段失败". 零 throw 契约允许库内 catch - 异常不外泄
+    /// 该错误是否表示任务在排队期间被取消(任务体未曾执行)
+    [[nodiscard]]
+    inline bool is_cancelled(const std::exception_ptr& e) noexcept {
+        return detail::error_is<operation_cancelled>(e);
+    }
+
+    /// 从错误通道辨识"提交阶段失败"
     /// @return 若该错误由 submit_error 承载则返回之, 否则 nullopt
     [[nodiscard]]
     inline std::optional<submit_error> submit_error_of(const std::exception_ptr& e) noexcept {
@@ -66,21 +81,6 @@ namespace concurrent {
             return se;
         } catch (...) {
             return std::nullopt;
-        }
-    }
-
-    /// 该错误是否表示任务在排队期间被取消(任务体未曾执行)
-    [[nodiscard]]
-    inline bool is_cancelled(const std::exception_ptr& e) noexcept {
-        if (!e) {
-            return false;
-        }
-        try {
-            std::rethrow_exception(e);
-        } catch (const operation_cancelled&) {
-            return true;
-        } catch (...) {
-            return false;
         }
     }
 

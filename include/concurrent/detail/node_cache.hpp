@@ -1,14 +1,17 @@
 #pragma once
-#include <atomic>
 #include <concepts>
 #include <cstddef>
 
 namespace concurrent::detail {
 
     /**
-     * @brief 每 worker 的任务节点缓存: MPSC Treiber 栈 + 容量上限
+     * @brief 每 worker 的任务节点缓存: 侵入式空闲栈 + 容量上限
      *
-     * 压栈来自任意线程(谁执行完谁归还), 弹出仅限所有者 -> 单一消费者, 无 ABA
+     * **单线程访问**
+     * 归还与取用都发生在缓存所属的 worker 自己的线程上 - 节点由谁执行就
+     * 回谁的缓存, 提交路径亦只碰调用线程自己那份. 拆除期的排空则排在
+     * join 之后. 故本结构无并发访问者, 不需要原子量: 每个任务因此省下
+     * 一次入栈 CAS, 一次出栈 CAS 与两次计数 RMW
      *
      * **为什么必须设上限**
      * 外部线程提交时节点只能由 new 取得 - 它不属于任何 worker, 没有本地缓存.
@@ -16,10 +19,6 @@ namespace concurrent::detail {
      * 不会来取. 于是无上限时缓存长度随**累计**任务数单调增长: 实测 4 worker
      * 单外部生产者, 每百万任务滞留约 128 MiB, 且 wait() 之后一分不还.
      * 峰值在途任务数有界, 保留内存却无界 - 对长期运行的池等同于泄漏
-     *
-     * **计数是近似值**
-     * 并发压栈可能同时越过上限判定, 超额至多为并发压栈方个数. 判定偏保守
-     * 无害: 宁可多还给分配器, 不可滞留. 弹出侧单线程, 故计数不会下溢
      *
      * @tparam Node     须提供 `Node* next_free` 成员
      * @tparam Capacity 缓存上限(节点数)
@@ -32,46 +31,38 @@ namespace concurrent::detail {
     public:
         static constexpr std::size_t capacity = Capacity;
 
-        /// 归还一个节点(任意线程)
+        /// 归还一个节点
         /// @return true = 已收入缓存; false = 已满, 调用方须自行销毁该节点
         [[nodiscard]]
         bool push(Node* n) noexcept {
-            if (size_.load(std::memory_order_relaxed) >= Capacity) {
+            if (size_ >= Capacity) {
                 return false;
             }
-            size_.fetch_add(1, std::memory_order_relaxed);
-            Node* h = head_.load(std::memory_order_relaxed);
-            do {
-                n->next_free = h;
-            } while (!head_.compare_exchange_weak(h, n, std::memory_order_release,
-                                                  std::memory_order_relaxed));
+            n->next_free = head_;
+            head_ = n;
+            ++size_;
             return true;
         }
 
-        /// 取一个节点; 空则 nullptr. 仅所有者线程调用
+        /// 取一个节点; 空则 nullptr
         [[nodiscard]]
         Node* pop() noexcept {
-            Node* h = head_.load(std::memory_order_acquire);
-            while (h) {
-                if (head_.compare_exchange_weak(h, h->next_free, std::memory_order_acquire,
-                                                std::memory_order_acquire)) {
-                    size_.fetch_sub(1, std::memory_order_relaxed);
-                    return h;
-                }
+            Node* h = head_;
+            if (h) {
+                head_ = h->next_free;
+                --size_;
             }
-            return nullptr;
+            return h;
         }
 
-        /// 近似长度(观测与测试用, 不作同步依据)
         [[nodiscard]]
-        std::size_t size_approx() const noexcept {
-            return size_.load(std::memory_order_relaxed);
+        std::size_t size() const noexcept {
+            return size_;
         }
 
     private:
-        // 二者被同一次 push/pop 一并触碰, 故刻意同居一行
-        std::atomic<Node*> head_{nullptr};
-        std::atomic<std::size_t> size_{0};
+        Node* head_ = nullptr;
+        std::size_t size_ = 0;
     };
 
 } // namespace concurrent::detail

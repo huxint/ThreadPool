@@ -272,16 +272,16 @@ TEST_SUITE("concurrent.detail") {
         stub_node a, b, c, d, e;
 
         CHECK(cache.pop() == nullptr); // 空
-        CHECK(cache.size_approx() == std::size_t{0});
+        CHECK(cache.size() == std::size_t{0});
 
         CHECK(cache.push(&a));
         CHECK(cache.push(&b));
         CHECK(cache.push(&c));
         CHECK(cache.push(&d));
-        CHECK(cache.size_approx() == std::size_t{4});
+        CHECK(cache.size() == std::size_t{4});
 
         CHECK(!cache.push(&e)); // 超限拒绝: 调用方负责销毁
-        CHECK(cache.size_approx() == std::size_t{4});
+        CHECK(cache.size() == std::size_t{4});
     }
 
     TEST_CASE("node_cache_pop_drains_and_decrements") {
@@ -294,41 +294,34 @@ TEST_SUITE("concurrent.detail") {
         stub_node* first = cache.pop();
         stub_node* second = cache.pop();
         CHECK(cache.pop() == nullptr); // 排空
-        CHECK(cache.size_approx() == std::size_t{0});
+        CHECK(cache.size() == std::size_t{0});
         CHECK(((first == &a && second == &b) || (first == &b && second == &a)));
         CHECK(first != second);
 
         // 排空后可重新收容
         CHECK(cache.push(first));
-        CHECK(cache.size_approx() == std::size_t{1});
+        CHECK(cache.size() == std::size_t{1});
     }
 
     // 回归: 无上限的空闲链在"外部生产者持续提交"下内存单调增长.
-    // 并发压栈一轮, 验证计数与弹出总量一致(无丢失)
-    TEST_CASE("node_cache_concurrent_push_accounting") {
+    // 压栈超出上限后, 弹出总量 + 被拒量 == 总压栈量(计数不丢, 内存不滞留)
+    TEST_CASE("node_cache_push_accounting_past_capacity") {
         constexpr std::size_t cap = 64;
         node_cache<stub_node, cap> cache;
         std::vector<stub_node> nodes(cap * 4);
-        std::atomic<std::size_t> rejected{0};
+        std::size_t rejected = 0;
 
-        std::vector<std::jthread> ts;
-        for (int t = 0; t < 4; ++t) {
-            ts.emplace_back([&, t] {
-                const std::size_t base = static_cast<std::size_t>(t) * cap;
-                for (std::size_t i = 0; i < cap; ++i) {
-                    if (!cache.push(&nodes[base + i])) {
-                        rejected.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-            });
+        for (auto& n : nodes) {
+            if (!cache.push(&n)) {
+                ++rejected;
+            }
         }
-        ts.clear();
+        CHECK(cache.size() == cap);
 
-        // 弹出总量 + 被拒量 == 总压栈量: 计数不丢
         std::size_t drained = 0;
         while (cache.pop()) {
             ++drained;
         }
-        CHECK(drained + rejected.load() == cap * 4);
+        CHECK(drained + rejected == cap * 4);
     }
 }

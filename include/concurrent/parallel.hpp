@@ -183,8 +183,14 @@ namespace concurrent {
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
                 for (auto&& e : range_) {
-                    slot_t slot = submit_one(std::forward<decltype(e)>(e));
-                    slots_.push_back(std::move(slot));
+                    // 扩容必须发生在提交**之前**: 反过来一旦 push_back 的
+                    // 分配抛出, 那个已入队的任务就游离于 slots_ 之外 - 析构
+                    // 等不到它, 而它的闭包还引用着 fn_ 与元素地址. 手动按
+                    // 倍率预留, 其后的 push_back 必不分配(槽的移动是 noexcept)
+                    if (slots_.size() == slots_.capacity()) {
+                        slots_.reserve(slots_.empty() ? 16 : slots_.capacity() * 2);
+                    }
+                    slots_.push_back(submit_one(std::forward<decltype(e)>(e)));
                 }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
