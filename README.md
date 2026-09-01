@@ -41,8 +41,6 @@ ctest --test-dir build          # 测试
 库本身零依赖 header-only: 消费方 `add_subdirectory` 后 `target_link_libraries(app PRIVATE concurrent)` 即可, 或直接把 `include/` 加入头文件搜索路径并链接 Threads
 
 ```cpp
-
-```cpp
 #include <concurrent/pool.hpp>
 #include <print>
 
@@ -51,12 +49,14 @@ using namespace concurrent;
 pool p({.threads = 4});
 
 // 即发即忘, callable 必须 noexcept
-(void)p.execute([]() noexcept { /* ... */ });
+static_cast<void>(p.execute([]() noexcept { /* ... */ }));
 
-// 有返回值: submit 返回 expected<task<T>, submit_error>
+// 有返回值: submit 返回 expected<task<T>, submit_error>; 结果恰好可取一次
 auto t = p.submit([](int a, int b) { return a + b; }, 10, 20);
-if (t && t->get()) {
-    std::println("{}", *t->get());
+if (t) {
+    if (auto r = t->get()) {
+        std::println("{}", *r);
+    }
 }
 
 // 函数式组合: when_all 汇合多任务, map 变换结果
