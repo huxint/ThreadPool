@@ -420,6 +420,32 @@ namespace concurrent {
             });
         }
 
+        /**
+         * @brief 结构化 work-first 派生: f 提交入池, g 由调用线程内联执行
+         *
+         * 递归分治的惯用形态: 提交分支先入队供任何 worker 窃取, 内联分支
+         * 沿调用栈深度优先执行, 保有缓存局部性; 每层只付一次提交通道,
+         * 较双提交省一半入队与记账开销. 返回后两分支各自在途, 以池级
+         * wait()/shutdown 汇合 - 自身不阻塞, 故在 worker 内调用安全(与
+         * wait/shutdown 相反). f 须 noexcept(与 execute 同); g 直接内联,
+         * 其异常按直接调用语义传播(worker 内由任务体的异常通道接住).
+         * 提交失败(已停/OOM)则 g 不执行, 以免半棵计算树落空
+         */
+        template <typename F1, typename F2>
+            requires std::is_nothrow_invocable_v<F1&>
+        [[nodiscard]]
+        std::expected<void, submit_error> fork_join(F1&& f, F2&& g) {
+            return guard_oom([&] {
+                // 先入队的 f 先可窃取, 再跑内联分支(work-first)
+                if (auto ok = execute_impl(task_priority::normal, std::forward<F1>(f));
+                    !ok) {
+                    return ok;
+                }
+                std::invoke(std::forward<F2>(g));
+                return std::expected<void, submit_error>{};
+            });
+        }
+
         /// 阻塞直至全部任务完成(排队 + 运行中). 虚假唤醒安全.
         /// 唤醒常态即时(完成路径的捷径), 最坏多等一个自旋预算(见 complete_one)
         /// @pre 调用者不得是本池的 worker - 其正在执行的任务自身就持有

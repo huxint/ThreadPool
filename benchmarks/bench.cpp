@@ -37,6 +37,8 @@
 // - 同一负载, 同一线程数, 每项取多轮最优
 // - 各池使用其惯用 API: 无结果通道优先(execute / silent_async / detach_task),
 //   带结果统一走各自的 async / submit
+// - 递归派生统一 work-first 形态(一支内联, 一支入队; TBB 行与本库行同款),
+//   以深度优先的缓存局部性代表各自的最佳实践
 // - 完成判定统一采用任务内计数器 + 主线程自旋等待, 不依赖任何一方的等待原语
 namespace {
 
@@ -302,10 +304,11 @@ int main(int argc, char** argv) {
                     leaves.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
-                for (int i = 0; i < 2; ++i) {
-                    static_cast<void>(
-                        p.execute([&p, &leaves, d]() noexcept { go(p, leaves, d - 1); }));
-                }
+                // work-first: 一支入队供窃取, 一支内联沿深度优先(与扩展
+                // 基线中 TBB 行的派生形态同款)
+                static_cast<void>(
+                    p.fork_join([&p, &leaves, d]() noexcept { go(p, leaves, d - 1); },
+                                [&p, &leaves, d]() noexcept { go(p, leaves, d - 1); }));
             }
         };
 
@@ -771,10 +774,10 @@ int main(int argc, char** argv) {
                         leaves.fetch_add(1, std::memory_order_relaxed);
                         return;
                     }
-                    for (int i = 0; i < 2; ++i) {
-                        static_cast<void>(
-                            p.execute([&, d]() noexcept { self(self, d - 1); }));
-                    }
+                    // work-first: 与左侧 TBB 行同款派生形态
+                    static_cast<void>(
+                        p.fork_join([&, d]() noexcept { self(self, d - 1); },
+                                    [&, d]() noexcept { self(self, d - 1); }));
                 };
                 go(go, depth);
                 wait_count(leaves, leaves_expect);

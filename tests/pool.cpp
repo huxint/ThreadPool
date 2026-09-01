@@ -1001,4 +1001,43 @@ TEST_SUITE("concurrent.pool") {
         static_cast<void>(0); // 非 Linux 或 ASan: 静默跳过
 #endif
     }
+
+    TEST_CASE("fork_join_work_first_recursive_sum") {
+        pool p({.threads = 4});
+        constexpr std::size_t n = 1uz << 16;
+        std::atomic<long> sum{0};
+        auto go = [&](auto&& self, std::size_t lo, std::size_t hi) -> void {
+            if (hi - lo == 1) {
+                sum.fetch_add(static_cast<long>(lo), std::memory_order_relaxed);
+                return;
+            }
+            const std::size_t mid = lo + (hi - lo) / 2;
+            (void)p.fork_join([&, lo, mid]() noexcept { self(self, lo, mid); },
+                              [&, lo = mid, mid = hi]() noexcept { self(self, lo, mid); });
+        };
+        go(go, 0, n);
+        p.wait();
+        CHECK(sum.load() == n * (n - 1) / 2);
+    }
+
+    TEST_CASE("fork_join_inline_branch_runs_on_calling_thread") {
+        pool p({.threads = 2});
+        std::atomic<bool> submitted_ran{false};
+        std::thread::id inline_id{};
+        (void)p.fork_join([&]() noexcept { submitted_ran.store(true); },
+                          [&] { inline_id = std::this_thread::get_id(); });
+        CHECK(inline_id == std::this_thread::get_id());
+        p.wait();
+        CHECK(submitted_ran.load());
+    }
+
+    TEST_CASE("fork_join_on_stopped_pool_returns_stopped_and_skips_inline") {
+        pool p({.threads = 2});
+        p.shutdown(shutdown_policy::discard);
+        bool inline_ran = false;
+        auto r = p.fork_join([]() noexcept {}, [&] { inline_ran = true; });
+        CHECK(!r);
+        CHECK(r.error() == submit_error::stopped);
+        CHECK(!inline_ran);
+    }
 }
