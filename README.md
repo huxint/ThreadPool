@@ -88,7 +88,7 @@ p.wait();
 
 `submit` 的 callable 接受 `const std::stop_token&` 首参即获得协作取消能力, 返回的 `task` 携带 `request_stop()`
 
-task 组合子(均在完成任务的工作线程上内联执行, 结果值恰好可取一次):
+task 组合子(均在完成任务的工作线程上内联执行; 结果值恰好可领取一次, 不论经 `get` 还是续延, 迟到者得到 `invalid_task`):
 
 | 组合子 | 行为 |
 |--------|------|

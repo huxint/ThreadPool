@@ -20,12 +20,12 @@ namespace concurrent::detail {
      * 单外部生产者, 每百万任务滞留约 128 MiB, 且 wait() 之后一分不还.
      * 峰值在途任务数有界, 保留内存却无界 - 对长期运行的池等同于泄漏
      *
-     * @tparam Node     须提供 `Node* next_free` 成员
+     * @tparam Node     须提供 `Node* next` 成员
      * @tparam Capacity 缓存上限(节点数)
      */
     template <typename Node, std::size_t Capacity>
         requires requires(Node* n) {
-            { n->next_free } -> std::convertible_to<Node*>;
+            { n->next } -> std::convertible_to<Node*>;
         }
     class node_cache {
     public:
@@ -38,7 +38,7 @@ namespace concurrent::detail {
             if (size_ >= Capacity) {
                 return false;
             }
-            n->next_free = head_;
+            n->next = head_;
             head_ = n;
             ++size_;
             return true;
@@ -49,7 +49,7 @@ namespace concurrent::detail {
         Node* pop() noexcept {
             Node* h = head_;
             if (h) {
-                head_ = h->next_free;
+                head_ = h->next;
                 --size_;
             }
             return h;

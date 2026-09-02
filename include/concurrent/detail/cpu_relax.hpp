@@ -1,9 +1,7 @@
 #pragma once
 
-#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || defined(__arm__) ||        \
-    defined(__powerpc__)
-#define CONCURRENT_HAS_PAUSE_INSN 1
-#else
+#if !(defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || defined(__arm__) ||     \
+      defined(__powerpc__))
 #include <thread> // 仅兜底分支需要
 #endif
 

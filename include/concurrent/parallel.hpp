@@ -1,6 +1,7 @@
 #pragma once
 #include "concurrent/pool.hpp"
 #include "concurrent/task.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <exception>
 #include <expected>
@@ -23,13 +24,6 @@ namespace concurrent {
         template <typename V>
         inline constexpr bool carry_by_pointer_v =
             std::is_lvalue_reference_v<std::ranges::range_reference_t<V>>;
-
-        /// 分块粒度解析: grain == 0 时按池线程数取块大小(至少 1)
-        template <typename Pool>
-        [[nodiscard]]
-        std::size_t chunk_grain(const Pool& p, std::size_t grain) noexcept {
-            return grain != 0 ? grain : std::max<std::size_t>(p.thread_count(), 1u);
-        }
 
     } // namespace detail
 
@@ -141,13 +135,8 @@ namespace concurrent {
         /// 已成功提交(入队)的元素个数(launch 之前为 0); 提交失败的槽位不计入
         [[nodiscard]]
         std::size_t submitted() const noexcept {
-            std::size_t ok = 0;
-            for (const auto& s : slots_) {
-                if (s.has_value()) {
-                    ++ok;
-                }
-            }
-            return ok;
+            return static_cast<std::size_t>(
+                std::ranges::count_if(slots_, [](const slot_t& s) { return s.has_value(); }));
         }
 
         /// 整批性失败(提交期抛出的异常): 容器扩容等分配失败仍经 submit_error
@@ -221,9 +210,7 @@ namespace concurrent {
         [[nodiscard]]
         value_type fetch(std::size_t i) {
             if (i >= slots_.size()) {
-                // 哨兵位仅在整批失败时可达(count 的定义); 兜底分支防御性保留
-                return std::unexpected(
-                    fatal_ ? fatal_ : std::make_exception_ptr(submit_error::out_of_memory));
+                return std::unexpected(fatal_); // 哨兵位: 仅整批失败时可达(见 count)
             }
             auto& s = slots_[i];
             if (!s) {
@@ -279,9 +266,7 @@ namespace concurrent {
                  std::is_void_v<std::invoke_result_t<F&, std::ranges::range_reference_t<R>>>
     [[nodiscard]]
     auto parallel_for(Pool& p, R&& range, F fn) {
-        using view_t = std::views::all_t<R&&>;
-        return parallel_view<Pool, view_t, F>{p, std::views::all(std::forward<R>(range)),
-                                              std::move(fn)};
+        return parallel_map(p, std::forward<R>(range), std::move(fn));
     }
 
     namespace detail {
@@ -289,6 +274,17 @@ namespace concurrent {
         /// 分块视图类型: 经 views::all 归一后的底层区间再 chunk
         template <typename R>
         using chunked_of = std::ranges::chunk_view<std::views::all_t<R&&>>;
+
+        /// 分块: grain == 0 时块大小取池线程数(至少 1)
+        template <typename Pool, typename R>
+        [[nodiscard]]
+        chunked_of<R> chunked(const Pool& p, R&& range, std::size_t grain) {
+            const std::size_t size =
+                grain != 0 ? grain : std::max<std::size_t>(p.thread_count(), 1);
+            return chunked_of<R>{
+                std::views::all(std::forward<R>(range)),
+                static_cast<std::ranges::range_difference_t<std::views::all_t<R&&>>>(size)};
+        }
 
     } // namespace detail
 
@@ -309,13 +305,8 @@ namespace concurrent {
         requires std::invocable<F&, std::ranges::range_reference_t<detail::chunked_of<R>>>
     [[nodiscard]]
     auto parallel_map_chunked(Pool& p, R&& range, F fn, std::size_t grain = 0) {
-        using chunked_t = detail::chunked_of<R>;
-        return parallel_view<Pool, chunked_t, F>{
-            p,
-            chunked_t{std::views::all(std::forward<R>(range)),
-                      static_cast<std::ranges::range_difference_t<std::views::all_t<R&&>>>(
-                          detail::chunk_grain(p, grain))},
-            std::move(fn)};
+        return parallel_view<Pool, detail::chunked_of<R>, F>{
+            p, detail::chunked(p, std::forward<R>(range), grain), std::move(fn)};
     }
 
     /**
@@ -332,13 +323,7 @@ namespace concurrent {
                      std::invoke_result_t<F&, std::ranges::range_reference_t<detail::chunked_of<R>>>>
     [[nodiscard]]
     auto parallel_for_chunked(Pool& p, R&& range, F fn, std::size_t grain = 0) {
-        using chunked_t = detail::chunked_of<R>;
-        return parallel_view<Pool, chunked_t, F>{
-            p,
-            chunked_t{std::views::all(std::forward<R>(range)),
-                      static_cast<std::ranges::range_difference_t<std::views::all_t<R&&>>>(
-                          detail::chunk_grain(p, grain))},
-            std::move(fn)};
+        return parallel_map_chunked(p, std::forward<R>(range), std::move(fn), grain);
     }
 
 } // namespace concurrent

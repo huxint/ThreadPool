@@ -1,5 +1,4 @@
 #pragma once
-#include "concurrent/detail/contract_assert.hpp"
 #include <array>
 #include <atomic>
 #include <bit>
@@ -34,9 +33,8 @@ namespace concurrent::detail {
                 if (dif == 0) {
                     if (tail_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed,
                                                     std::memory_order_relaxed)) {
-                        // 索引协议: seq == pos 即该槽"对本轮位置为空"; CAS 成功后
-                        // 本线程独占该槽, 直至把 seq 发布为 pos+1
-                        CONCURRENT_CONTRACT_ASSERT(seq == static_cast<std::intptr_t>(pos));
+                        // seq == pos 即该槽对本轮位置为空; CAS 成功后本线程独占
+                        // 该槽, 直至把 seq 发布为 pos+1
                         c.value = value;
                         c.seq.store(static_cast<std::intptr_t>(pos) + 1, std::memory_order_release);
                         return true;
@@ -60,9 +58,8 @@ namespace concurrent::detail {
                 if (dif == 0) {
                     if (head_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed,
                                                     std::memory_order_relaxed)) {
-                        // 索引协议: seq == pos+1 即该槽已写入待弹出; CAS 成功后
-                        // 本线程独占该槽, 直至把 seq 发布为 pos+Capacity(下一轮的空)
-                        CONCURRENT_CONTRACT_ASSERT(seq == static_cast<std::intptr_t>(pos) + 1);
+                        // seq == pos+1 即该槽已写入待弹出; CAS 成功后本线程独占
+                        // 该槽, 直至把 seq 发布为 pos+Capacity(下一轮的空)
                         T v = c.value;
                         c.seq.store(static_cast<std::intptr_t>(pos) + Capacity,
                                     std::memory_order_release);
@@ -78,8 +75,8 @@ namespace concurrent::detail {
 
         [[nodiscard]]
         std::size_t size_approx() const noexcept {
-            auto h = head_.load(std::memory_order_acquire);
-            auto t = tail_.load(std::memory_order_acquire);
+            auto h = head_.load(std::memory_order_relaxed);
+            auto t = tail_.load(std::memory_order_relaxed);
             return t > h ? t - h : 0;
         }
 

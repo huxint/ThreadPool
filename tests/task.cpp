@@ -73,6 +73,46 @@ TEST_SUITE("concurrent.task") {
         CHECK(m.get().value_or(-1) == 25);
     }
 
+    TEST_CASE("map_to_void_on_valued_task") {
+        pool p({.threads = 2});
+        auto t = p.submit([] { return 5; });
+        REQUIRE(t.has_value());
+        std::atomic<int> seen{0};
+        auto m = t->map([&seen](int v) { seen.store(v, std::memory_order_relaxed); });
+        CHECK(m.get().has_value());
+        CHECK(seen.load() == 5);
+    }
+
+    // 结果只能领取一次, 不论领取者是 get 还是续延: 迟到者得到 invalid_task,
+    // 而非从已搬空的槽里再搬一次
+    TEST_CASE("value_claimed_once_across_get_and_continuations") {
+        pool p({.threads = 2});
+        auto t = p.submit([] { return std::string(64, 'x'); });
+        REQUIRE(t.has_value());
+        REQUIRE(t->get().has_value());
+        auto late = t->map([](std::string s) { return s.size(); });
+        auto r = late.get();
+        REQUIRE(!r.has_value());
+        CHECK(is_invalid_task(r.error()));
+
+        auto u = p.submit([] { return 7; });
+        REQUIRE(u.has_value());
+        u->wait(); // 两个续延都走内联路径, 领取顺序确定
+        auto first = u->map([](int v) { return v; });
+        auto second = u->map([](int v) { return v; });
+        CHECK(first.get().value_or(-1) == 7);
+        auto r2 = second.get();
+        REQUIRE(!r2.has_value());
+        CHECK(is_invalid_task(r2.error()));
+
+        auto w = p.submit([] { return 1; });
+        REQUIRE(w.has_value());
+        REQUIRE(w->get().has_value());
+        auto r3 = when_all(std::move(*w)).get();
+        REQUIRE(!r3.has_value());
+        CHECK(is_invalid_task(r3.error()));
+    }
+
     TEST_CASE("map_on_void_task_invokes_without_args") {
         pool p({.threads = 2});
         auto t = p.submit([] {});

@@ -1,19 +1,18 @@
 #pragma once
 #include "concurrent/detail/sbo_function.hpp"
-#include "concurrent/detail/spinlock.hpp"
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <expected>
+#include <functional>
 #include <memory>
-#include <mutex>
 #include <new>
 #include <optional>
 #include <stop_token>
 #include <tuple>
 #include <type_traits>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace concurrent {
@@ -28,7 +27,7 @@ namespace concurrent {
     struct operation_cancelled {};
 
     /// 无效任务的错误标记: 默认构造的句柄经 get(), 或结果已被消费后的
-    /// 再次 get(). 具名类型使该路径可安全重抛, 也可被 is_cancelled /
+    /// 再次领取. 具名类型使该路径可安全重抛, 也可被 is_cancelled /
     /// submit_error_of 判别为"非取消, 非提交失败"
     struct invalid_task {};
 
@@ -39,49 +38,41 @@ namespace concurrent {
     }
 
     namespace detail {
-        /// 错误通道的类型判别. 零 throw 契约允许库内 catch - 异常不外泄
+        /// 错误通道的类型判别与还原: exception_ptr 的动态类型只能经重抛
+        /// 辨识. 零 throw 契约允许库内 catch - 异常不外泄
         template <typename E>
         [[nodiscard]]
-        bool error_is(const std::exception_ptr& e) noexcept {
+        std::optional<E> error_as(const std::exception_ptr& e) noexcept {
             if (!e) {
-                return false;
+                return std::nullopt;
             }
             try {
                 std::rethrow_exception(e);
-            } catch (const E&) {
-                return true;
+            } catch (const E& v) {
+                return v;
             } catch (...) {
-                return false;
             }
+            return std::nullopt;
         }
     } // namespace detail
 
     /// 该错误是否表示任务句柄无效(默认构造 / 结果已被消费)
     [[nodiscard]]
     inline bool is_invalid_task(const std::exception_ptr& e) noexcept {
-        return detail::error_is<invalid_task>(e);
+        return detail::error_as<invalid_task>(e).has_value();
     }
 
     /// 该错误是否表示任务在排队期间被取消(任务体未曾执行)
     [[nodiscard]]
     inline bool is_cancelled(const std::exception_ptr& e) noexcept {
-        return detail::error_is<operation_cancelled>(e);
+        return detail::error_as<operation_cancelled>(e).has_value();
     }
 
     /// 从错误通道辨识"提交阶段失败"
     /// @return 若该错误由 submit_error 承载则返回之, 否则 nullopt
     [[nodiscard]]
     inline std::optional<submit_error> submit_error_of(const std::exception_ptr& e) noexcept {
-        if (!e) {
-            return std::nullopt;
-        }
-        try {
-            std::rethrow_exception(e);
-        } catch (submit_error se) {
-            return se;
-        } catch (...) {
-            return std::nullopt;
-        }
+        return detail::error_as<submit_error>(e);
     }
 
     /// 任务句柄前向声明
@@ -90,23 +81,19 @@ namespace concurrent {
 
     namespace detail {
 
-        struct void_passthrough {};
-
         /// 任务节点: 窃取队列与全局队列上流转的实体. 稳态由每 worker 空闲链表回收;
         /// 队列槽中仅存指针(平凡可拷贝), 保证 Chase-Lev 读-CAS 语义安全
-        ///
-        /// 两个链接字段服务于互斥的三种归属(环/溢出链, 空闲链), 故不会同时使用:
         struct task_node {
-            /// SBO=64 时节点 112B 落 malloc 128B 桶(浪费 16); 80 恰好 128B
-            /// 填满桶, 96 则跨到 160B 桶. 80 是零内存代价下的最大容量
-            sbo_function<80> body;
+            /// 88 使节点恰好 128B 填满 malloc 的 128B 桶: 零内存代价下的最大 SBO 容量
+            sbo_function<88> body;
             /// 排队中被关闭丢弃时的状态收尾(仅 submit 路径设置). 必须先于
             /// body 析构调用: 闭包持有共享状态引用, 若随节点直接湮灭,
             /// 用户侧 get() 将在 done 等待上永久阻塞
             void (*discard)(void* state) noexcept = nullptr;
             void* discard_ctx = nullptr;
-            task_node* next_free = nullptr; ///< 归属"每 worker 空闲链"时的后继
-            task_node* next_q = nullptr;    ///< 归属"全局队列溢出链"时的后继
+            /// 侵入式链接: 归属全局队列溢出链或 worker 空闲链时的后继. 节点
+            /// 同一时刻只在一处, 两种归属共用一个字段
+            task_node* next = nullptr;
         };
 
         /// 续延节点: 任务完成时被内联执行一次的类型擦除回调
@@ -124,11 +111,20 @@ namespace concurrent {
         struct cont_impl : cont_node {
             cont_impl() noexcept {
                 invoke = [](cont_node* self, void* p) noexcept {
-                    static_cast<Derived*>(self)->run(*reinterpret_cast<ParentState*>(p));
+                    static_cast<Derived*>(self)->run(*static_cast<ParentState*>(p));
                 };
                 destroy = [](cont_node* self) noexcept { delete static_cast<Derived*>(self); };
             }
         };
+
+        /// 挂接续延; 父任务已完成则立即内联执行并销毁节点
+        template <typename State, typename Node>
+        void attach_or_run(State& st, Node* n) noexcept {
+            if (!st.attach(n)) {
+                n->run(st);
+                delete n;
+            }
+        }
 
         /// 前置声明: 深度守卫基础设施的签名需要(定义在下方)
         template <typename T>
@@ -198,18 +194,55 @@ namespace concurrent {
             st->finish();
         }
 
-        /// 值存储: 非 void 用对齐裸存储; void 用零体积 monostate 占位
-        /// 特化而非 std::conditional_t, 避免 sizeof(void)/alignof(void) 在非选中分支被实例化
-        /// (不用 std::aligned_storage_t - C++23 起已弃用)
+        /// 显式生命周期的值槽: 对齐裸存储 + 存活位. 析构时仍存活即销毁 -
+        /// 结果值未被取走的状态(只 wait 不 get / 丢弃的组合子中间态 / 只迭代
+        /// 半个 parallel_view)不漏掉 T 的析构
         template <typename T>
-        struct value_storage {
-            struct type {
-                alignas(T) std::byte buf[sizeof(T)];
-            };
+        class value_slot {
+        public:
+            value_slot() = default;
+            value_slot(const value_slot&) = delete;
+            value_slot& operator=(const value_slot&) = delete;
+            ~value_slot() {
+                if (live_) {
+                    std::destroy_at(ptr());
+                }
+            }
+
+            template <typename... A>
+            void emplace(A&&... a) noexcept(std::is_nothrow_constructible_v<T, A...>) {
+                ::new (static_cast<void*>(buf_)) T(std::forward<A>(a)...);
+                live_ = true;
+            }
+
+            /// 按值取走并销毁源: 只移动不销毁, 移动后残壳持有的资源乃至只可
+            /// 拷贝类型的整个对象都会滞留. 移动构造抛出时存活位不变, 交由析构收尾
+            [[nodiscard]]
+            T take() noexcept(std::is_nothrow_move_constructible_v<T>) {
+                T out{std::move(*ptr())};
+                std::destroy_at(ptr());
+                live_ = false;
+                return out;
+            }
+
+            [[nodiscard]]
+            bool has_value() const noexcept {
+                return live_;
+            }
+
+        private:
+            T* ptr() noexcept { return std::launder(reinterpret_cast<T*>(buf_)); }
+
+            alignas(T) std::byte buf_[sizeof(T)];
+            bool live_ = false;
         };
+
+        /// void 无值: 零体积占位, emplace() 为空操作, 使"发布值"在 void 与
+        /// 非 void 上写法一致
         template <>
-        struct value_storage<void> {
-            using type = std::monostate;
+        class value_slot<void> {
+        public:
+            void emplace() noexcept {}
         };
 
         /**
@@ -227,19 +260,6 @@ namespace concurrent {
         class shared_state {
         public:
             using value_type = T;
-
-            std::uint64_t id = 0; ///< trace 任务编号
-
-            /// value_ 是裸字节缓冲, 不会自行调用 T 的析构函数. 结果值未被取走
-            /// 就析构本状态时(只 wait 不 get / 丢弃组合子中间态 / 只迭代半个
-            /// parallel_view), 若不在此收尾则 T 的析构函数永不执行
-            ~shared_state() {
-                if constexpr (!std::is_void_v<T>) {
-                    if (has_value_) {
-                        std::destroy_at(std::launder(reinterpret_cast<T*>(&value_)));
-                    }
-                }
-            }
 
             shared_state() = default;
             shared_state(const shared_state&) = delete ("task states are shared, never copied");
@@ -283,7 +303,7 @@ namespace concurrent {
                 ++cont_depth; // 本帧的续延以内联深度计(见 cont_depth_limit)
                 while (list) {
                     cont_node* n = std::exchange(list, list->next);
-                    n->invoke(n, reinterpret_cast<void*>(this));
+                    n->invoke(n, static_cast<void*>(this));
                     n->destroy(n); // 续延节点一次性消耗
                 }
                 --cont_depth;
@@ -310,47 +330,38 @@ namespace concurrent {
 
             void set_exception(std::exception_ptr e) noexcept { exc_ = std::move(e); }
 
+            /// 取消即以 operation_cancelled 占据错误通道: get 与续延都只看
+            /// 该通道, 无须另设标志
             void set_cancelled() noexcept {
-                cancelled_ = true;
                 exc_ = std::make_exception_ptr(operation_cancelled{});
             }
 
-            template <typename U = T>
-                requires(!std::is_void_v<U>)
-            void emplace_value(U&& v) noexcept(std::is_nothrow_constructible_v<U, U&&>) {
-                ::new (static_cast<void*>(&value_)) T(std::forward<U>(v));
-                has_value_ = true;
+            template <typename... A>
+            void emplace_value(A&&... a) noexcept(std::is_nothrow_constructible_v<T, A...>) {
+                value_.emplace(std::forward<A>(a)...);
             }
 
-            /// 取走值(恰好一次; 外壳保证调用次序). 成员模板延迟实例化, 避免 T=void 时形成
-            /// void&
-            ///
-            /// 按值返回而非 T&&: 只有这样才能在调用方消费完之后销毁缓冲区里的源对象.
-            /// 移动后的残壳仍可能持有资源, 而只可拷贝的 T 更是整个对象都留在原处 -
-            /// 二者都必须析构. 代价是续延跳转多一次 T 的移动(get() 路径不变, 原本
-            /// 也是两次移动)
-            template <typename U = T>
-                requires(!std::is_void_v<U>)
+            /// 结果的一次性闸门: 首个领取者(get 或某个续延)得 true, 其余 false.
+            /// void 任务无值可搬, 单凭值槽存活位分不出"再次领取", 故闸门独立
+            /// 于值槽; 两份句柄并发领取也由此收敛成一次原子交换
             [[nodiscard]]
-            U take_value_unchecked() noexcept(std::is_nothrow_move_constructible_v<U>) {
-                U* p = std::launder(reinterpret_cast<U*>(&value_));
-                U out{std::move(*p)}; // 抛出则 has_value_ 仍为真, 交由析构函数收尾
-                std::destroy_at(p);
-                has_value_ = false;
-                return out;
+            bool claim() noexcept {
+                if (consumed_.exchange(true, std::memory_order_relaxed)) {
+                    return false;
+                }
+                if constexpr (std::is_void_v<T>) {
+                    return true;
+                } else {
+                    return value_.has_value();
+                }
             }
 
-            /// 非消耗性观察(inspect 用). 成员模板延迟实例化, 避免 T=void 时形成 void&
+            /// 搬走值. @pre claim() 已返回 true. 成员模板延迟实例化, T=void 不成形
             template <typename U = T>
                 requires(!std::is_void_v<U>)
             [[nodiscard]]
-            U& peek_value() noexcept {
-                return *std::launder(reinterpret_cast<U*>(&value_));
-            }
-
-            [[nodiscard]]
-            bool cancelled() const noexcept {
-                return cancelled_;
+            U take_value() noexcept(std::is_nothrow_move_constructible_v<U>) {
+                return value_.take();
             }
 
             [[nodiscard]]
@@ -376,28 +387,20 @@ namespace concurrent {
                 waiters_.fetch_sub(1, std::memory_order_release);
             }
 
-            /// 取走结果. invalid_task 标记表示结果已被消费
-            ///
-            /// 消费判定不能只看 has_value_: task<void> 没有值可搬走, 单凭那个
-            /// 标志"再次 get" 会照常返回成功, 与 task<T> 的语义分叉. 独立的
-            /// consumed_ 让两者一致, 顺带把"两份句柄并发 get"从对 has_value_
-            /// 的数据竞争收敛成一次原子交换
+            /// 取走结果. 错误可重复观测; 成功值恰好一次, 再次领取以 invalid_task 标记
             [[nodiscard]]
             std::expected<T, std::exception_ptr> take_result() {
                 wait_done();
                 if (exc_) {
                     return std::unexpected(exc_);
                 }
-                if (consumed_.exchange(true, std::memory_order_relaxed)) {
+                if (!claim()) {
                     return std::unexpected(invalid_task_error());
                 }
-                if constexpr (!std::is_void_v<T>) {
-                    if (!has_value_) {
-                        return std::unexpected(invalid_task_error());
-                    }
-                    return take_value_unchecked();
-                } else {
+                if constexpr (std::is_void_v<T>) {
                     return {};
+                } else {
+                    return take_value();
                 }
             }
 
@@ -414,14 +417,9 @@ namespace concurrent {
             mutable std::atomic<std::uint32_t> waiters_{0};
             std::stop_source source_{std::nostopstate};
             std::atomic<bool> stop_{false};
-            /// take_result 的一次性闸门(见其注释). 紧挨 stop_ 摆放是为了落进
-            /// exc_ 的对齐填充里 - 换到别处会把状态整体撑大一个字
             std::atomic<bool> consumed_{false};
             std::exception_ptr exc_ = nullptr;
-            [[no_unique_address]]
-            typename value_storage<T>::type value_{};
-            bool has_value_ = false;
-            bool cancelled_ = false;
+            [[no_unique_address]] value_slot<T> value_;
         };
 
         template <typename T>
@@ -430,32 +428,49 @@ namespace concurrent {
             return std::make_shared<shared_state<T>>(); // bad_alloc 由边界捕获
         }
 
+        /// 续延的共同骨架: 父任务失败(异常或取消)原样转交 on_error; 成功则
+        /// 领取值交付 on_value(void 父任务无参). 领取失败(值已被 get 或另一
+        /// 续延取走)与 on_value 抛出一律进 on_error, 一切出口 noexcept
+        /// @return 值是否成功交付
+        template <typename Parent, typename OnValue, typename OnError>
+        bool deliver(Parent& parent, OnValue&& on_value, OnError&& on_error) noexcept {
+            if (auto e = parent.raw_exception()) {
+                on_error(std::move(e));
+                return false;
+            }
+            if (!parent.claim()) {
+                on_error(invalid_task_error());
+                return false;
+            }
+            try {
+                if constexpr (std::is_void_v<typename Parent::value_type>) {
+                    on_value();
+                } else {
+                    on_value(parent.take_value());
+                }
+                return true;
+            } catch (...) {
+                on_error(std::current_exception());
+                return false;
+            }
+        }
+
         template <typename ParentState, typename F, typename U>
         struct map_cont final : cont_impl<ParentState, map_cont<ParentState, F, U>> {
             std::shared_ptr<shared_state<U>> dst;
             F fn;
 
             void run(ParentState& parent) noexcept {
-                using V = typename ParentState::value_type;
-                if (parent.cancelled()) {
-                    dst->set_cancelled();
-                } else if (auto e = parent.raw_exception()) {
-                    dst->set_exception(e);
-                } else {
-                    try {
-                        if constexpr (std::is_void_v<V>) {
-                            if constexpr (std::is_void_v<U>) {
-                                fn();
-                            } else {
-                                dst->emplace_value(fn());
-                            }
+                deliver(
+                    parent,
+                    [&](auto&&... v) {
+                        if constexpr (std::is_void_v<U>) {
+                            std::invoke(fn, std::forward<decltype(v)>(v)...);
                         } else {
-                            dst->emplace_value(fn(parent.take_value_unchecked()));
+                            dst->emplace_value(std::invoke(fn, std::forward<decltype(v)>(v)...));
                         }
-                    } catch (...) {
-                        dst->set_exception(std::current_exception());
-                    }
-                }
+                    },
+                    [&](std::exception_ptr e) { dst->set_exception(std::move(e)); });
                 finish_or_defer(std::move(dst));
             }
         };
@@ -466,23 +481,13 @@ namespace concurrent {
             F fn;
 
             void run(ParentState& parent) noexcept {
-                using V = typename ParentState::value_type;
-                if (parent.cancelled()) {
-                    dst->set_cancelled();
-                } else if (auto e = parent.raw_exception()) {
-                    dst->set_exception(e);
-                } else {
-                    try {
-                        if constexpr (std::is_void_v<V>) {
-                            fn();
-                        } else {
-                            fn(parent.peek_value());
-                            dst->emplace_value(parent.take_value_unchecked());
-                        }
-                    } catch (...) {
-                        dst->set_exception(std::current_exception());
-                    }
-                }
+                deliver(
+                    parent,
+                    [&](auto&&... v) {
+                        std::invoke(fn, v...); // 旁观以左值交付, 值随后原样转入子状态
+                        dst->emplace_value(std::move(v)...);
+                    },
+                    [&](std::exception_ptr e) { dst->set_exception(std::move(e)); });
                 finish_or_defer(std::move(dst));
             }
         };
@@ -498,98 +503,41 @@ namespace concurrent {
             std::shared_ptr<shared_state<U>> dst;
             F fn;
 
+            /// 内层任务完成 -> 结果原样转入本状态
+            struct forward final : cont_impl<inner_state_t, forward> {
+                std::shared_ptr<shared_state<U>> dst;
+
+                void run(inner_state_t& src) noexcept {
+                    deliver(
+                        src,
+                        [&](auto&&... v) { dst->emplace_value(std::forward<decltype(v)>(v)...); },
+                        [&](std::exception_ptr e) { dst->set_exception(std::move(e)); });
+                    finish_or_defer(std::move(dst));
+                }
+            };
+
             void run(ParentState& parent) noexcept {
-                using V = typename ParentState::value_type;
-                if (parent.cancelled()) {
-                    dst->set_cancelled();
+                auto fail = [&](std::exception_ptr e) {
+                    dst->set_exception(std::move(e));
                     finish_or_defer(std::move(dst));
-                    return;
-                }
-                if (auto e = parent.raw_exception()) {
-                    dst->set_exception(e);
-                    finish_or_defer(std::move(dst));
-                    return;
-                }
-                std::shared_ptr<inner_state_t> inner_st;
-                try {
-                    if constexpr (std::is_void_v<V>) {
-                        InnerTask inner = fn();
-                        inner_st = inner.st_;
-                    } else {
-                        InnerTask inner = fn(parent.take_value_unchecked());
-                        inner_st = inner.st_;
-                    }
-                } catch (...) {
-                    dst->set_exception(std::current_exception());
-                    finish_or_defer(std::move(dst));
-                    return;
-                }
-                if (!inner_st) {
-                    dst->set_exception(invalid_task_error());
-                    finish_or_defer(std::move(dst));
-                    return;
-                }
-                // 本状态的完成绑定到内层任务完成
-                struct fwd final : cont_impl<inner_state_t, fwd> {
-                    std::shared_ptr<shared_state<U>> dst;
-                    void run(inner_state_t& src) noexcept {
-                        if (src.cancelled()) {
-                            dst->set_cancelled();
-                        } else if (auto e = src.raw_exception()) {
-                            dst->set_exception(e);
-                        } else if constexpr (!std::is_void_v<U>) {
-                            dst->emplace_value(src.take_value_unchecked());
-                        }
-                        finish_or_defer(std::move(dst));
-                    }
                 };
-                auto* n = new (std::nothrow) fwd{{}, dst};
-                if (!n) {
-                    dst->set_exception(std::make_exception_ptr(std::bad_alloc{}));
-                    finish_or_defer(std::move(dst));
+                std::shared_ptr<inner_state_t> inner;
+                if (!deliver(
+                        parent,
+                        [&](auto&&... v) {
+                            inner = std::invoke(fn, std::forward<decltype(v)>(v)...).st_;
+                        },
+                        fail)) {
                     return;
                 }
-                if (!inner_st->attach(n)) {
-                    n->run(*inner_st); // 内层已完成: 立即内联
-                    delete n;
+                if (!inner) {
+                    return fail(invalid_task_error()); // 绑定返回了无效任务
                 }
-            }
-        };
-
-        template <typename T>
-        struct slot_store {
-            alignas(T) std::byte buf[sizeof(T)];
-            bool live = false;
-
-            slot_store() = default;
-            slot_store(const slot_store&) = delete;
-            slot_store& operator=(const slot_store&) = delete;
-            ~slot_store() {
-                if (live) {
-                    std::destroy_at(value());
+                auto* n = new (std::nothrow) forward{{}, dst};
+                if (!n) {
+                    return fail(std::make_exception_ptr(std::bad_alloc{}));
                 }
-            }
-
-            void put(T&& v) noexcept(std::is_nothrow_move_constructible_v<T>) {
-                ::new (static_cast<void*>(buf)) T(std::move(v));
-                live = true;
-            }
-            /// 按值返回并销毁源对象: 与 shared_state::take_value_unchecked 同理,
-            /// 若只把值移走而把残壳留在 buf 里(且 live 已置假), 析构函数就再也
-            /// 收不到它
-            [[nodiscard]]
-            T take() noexcept(std::is_nothrow_move_constructible_v<T>) {
-                T* p = value();
-                T out{std::move(*p)};
-                std::destroy_at(p);
-                live = false;
-                return out;
-            }
-
-        private:
-            [[nodiscard]]
-            T* value() noexcept {
-                return std::launder(reinterpret_cast<T*>(buf));
+                attach_or_run(*inner, n); // 本状态的完成绑定到内层任务完成
             }
         };
 
@@ -597,45 +545,38 @@ namespace concurrent {
             requires((!std::is_void_v<Ts>) && ...)
         class when_all_core {
         public:
-            static constexpr std::size_t n = sizeof...(Ts);
-
             explicit when_all_core(std::shared_ptr<shared_state<std::tuple<Ts...>>> d) noexcept
-                : dst(std::move(d)) {}
+                : dst_(std::move(d)) {}
 
-            std::shared_ptr<shared_state<std::tuple<Ts...>>> dst;
-            std::atomic<std::uint32_t> remaining{n};
-            std::exception_ptr first_err = nullptr;
-            bool errored = false; ///< 独立标志: 空 exception_ptr(无效任务)也算错误
-            std::tuple<slot_store<Ts>...> slots;
-
+            /// 首错优先: 交换闸门决出唯一写者, 其写入经 remaining_ 上 RMW 的
+            /// 释放序列传递给最后一个 settle_one(acq_rel), 无须互斥
             void record_error(std::exception_ptr e) noexcept {
-                std::scoped_lock g{lk}; // 首错优先; RAII 免去手写 unlock
-                if (!errored) {
-                    errored = true;
-                    first_err = std::move(e);
+                if (!errored_.exchange(true, std::memory_order_relaxed)) {
+                    first_err_ = std::move(e);
                 }
             }
 
             template <std::size_t I, typename V>
             void put(V&& v) noexcept(std::is_nothrow_move_constructible_v<V>) {
-                std::get<I>(slots).put(std::forward<V>(v));
+                std::get<I>(slots_).emplace(std::forward<V>(v));
             }
 
             void settle_one() noexcept {
-                if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    if (errored) {
-                        // 部分槽未填充: 绝不可组装 tuple, 直接以首错失败
-                        dst->set_exception(first_err);
-                    } else {
-                        try {
-                            dst->emplace_value(assemble());
-                        } catch (...) {
-                            dst->set_exception(std::current_exception());
-                        }
-                    }
-                    // dst 由本分支独占(remaining 归零仅一次): 移交守卫入口
-                    finish_or_defer(std::move(dst));
+                if (remaining_.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+                    return;
                 }
+                if (errored_.load(std::memory_order_relaxed)) {
+                    // 部分槽未填充: 绝不可组装 tuple, 直接以首错失败
+                    dst_->set_exception(std::move(first_err_));
+                } else {
+                    try {
+                        dst_->emplace_value(assemble());
+                    } catch (...) {
+                        dst_->set_exception(std::current_exception());
+                    }
+                }
+                // remaining_ 归零仅一次, dst_ 由本分支独占: 移交守卫入口
+                finish_or_defer(std::move(dst_));
             }
 
         private:
@@ -643,11 +584,15 @@ namespace concurrent {
             [[nodiscard]]
             std::tuple<Ts...> assemble() noexcept(
                 (std::is_nothrow_move_constructible_v<Ts> && ...)) {
-                auto& [...slot] = slots;
+                auto& [...slot] = slots_;
                 return std::tuple<Ts...>(slot.take()...);
             }
 
-            spinlock lk{};
+            std::shared_ptr<shared_state<std::tuple<Ts...>>> dst_;
+            std::atomic<std::uint32_t> remaining_{sizeof...(Ts)};
+            std::atomic<bool> errored_{false};
+            std::exception_ptr first_err_;
+            std::tuple<value_slot<Ts>...> slots_;
         };
 
         template <std::size_t I, typename ParentState, typename Core>
@@ -655,13 +600,9 @@ namespace concurrent {
             std::shared_ptr<Core> core;
 
             void run(ParentState& parent) noexcept {
-                if (parent.cancelled()) {
-                    core->record_error(std::make_exception_ptr(operation_cancelled{}));
-                } else if (auto e = parent.raw_exception()) {
-                    core->record_error(e);
-                } else {
-                    core->template put<I>(parent.take_value_unchecked());
-                }
+                deliver(
+                    parent, [&](auto&& v) { core->template put<I>(std::forward<decltype(v)>(v)); },
+                    [&](std::exception_ptr e) { core->record_error(std::move(e)); });
                 core->settle_one();
             }
         };
@@ -671,25 +612,18 @@ namespace concurrent {
         [[nodiscard]]
         task<T> failed_task() noexcept;
 
-        /// map/and_then 的结果类型计算: void 父任务 -> 续延无参; 非 void -> 续延接收 T&&
-        /// 用特化而非 std::conditional_t, 避免 T=void 时形成 void&&
+        /// 续延体的结果类型: void 父任务的续延无参, 非 void 接收 T&&
+        /// 特化而非 std::conditional_t, 避免 T=void 时形成 void&&
         template <typename T, typename F>
-        struct map_result_of {
+        struct cont_result {
             using type = std::invoke_result_t<F, T&&>;
         };
         template <typename F>
-        struct map_result_of<void, F> {
+        struct cont_result<void, F> {
             using type = std::invoke_result_t<F>;
         };
-
         template <typename T, typename F>
-        struct and_then_inner_of {
-            using type = std::invoke_result_t<F, T&&>;
-        };
-        template <typename F>
-        struct and_then_inner_of<void, F> {
-            using type = std::invoke_result_t<F>;
-        };
+        using cont_result_t = typename cont_result<T, F>::type;
 
     } // namespace detail
 
@@ -698,24 +632,22 @@ namespace concurrent {
      *        任务体异常经 exception_ptr 透传, 取消以 operation_cancelled 标记
      *
      * 单子表面: map(变换)/ and_then(绑定)/ inspect(旁观)均在完成任务
-     * 的工作线程上内联执行, 构造期零入队; 结果值恰好可取一次
+     * 的工作线程上内联执行, 构造期零入队. 结果值恰好可领取一次 - 不论经
+     * get 还是某个续延, 其余领取者得到 invalid_task
      *
      * @note st_ 为库内接线成员, 勿在库外触碰
      */
     template <typename T>
     class task {
-    public:
-        using value_type = T;
-
-    private:
-        // 尾置返回类型不属于完整类上下文, 别名必须先于使用声明
         using state_t = detail::shared_state<T>;
 
     public:
+        using value_type = T;
+
         task() = default;
 
         /// 内部构造(池与组合子使用)
-        explicit task(std::shared_ptr<detail::shared_state<T>> s) noexcept : st_(std::move(s)) {}
+        explicit task(std::shared_ptr<state_t> s) noexcept : st_(std::move(s)) {}
 
         /// 阻塞直至完成并取走结果
         [[nodiscard]]
@@ -747,55 +679,43 @@ namespace concurrent {
 
         /// 变换成功值: f 接收 T&&(void 任务无参), 在完成任务的工作线程上内联执行
         template <typename F>
-        auto map(this auto&& self, F&& f) -> task<typename detail::map_result_of<T, F>::type> {
-            using U = typename detail::map_result_of<T, F>::type;
-            if (!self.st_) [[unlikely]] {
-                return task<U>{}; // 无效任务的组合仍是无效任务
-            }
-            return self
-                .template attach_cont<U, detail::map_cont<state_t, std::decay_t<F>, U>>(
-                    std::forward<F>(f));
+        task<detail::cont_result_t<T, F>> map(F&& f) {
+            using U = detail::cont_result_t<T, F>;
+            return attach_cont<U, detail::map_cont<state_t, std::decay_t<F>, U>>(
+                std::forward<F>(f));
         }
 
         /// 绑定: f 接收 T&& 返回后续 task, 其结果透传为本次结果
         template <typename F>
-        auto and_then(this auto&& self, F&& f)
-            -> task<typename detail::and_then_inner_of<T, F>::type::value_type> {
-            using Inner = typename detail::and_then_inner_of<T, F>::type;
-            using U = typename Inner::value_type;
-            if (!self.st_) [[unlikely]] {
-                return task<U>{}; // 无效任务的组合仍是无效任务
-            }
-            return self
-                .template attach_cont<U, detail::and_then_cont<state_t, std::decay_t<F>, Inner>>(
-                    std::forward<F>(f));
+        auto and_then(F&& f) -> task<typename detail::cont_result_t<T, F>::value_type> {
+            using inner_t = detail::cont_result_t<T, F>;
+            return attach_cont<typename inner_t::value_type,
+                               detail::and_then_cont<state_t, std::decay_t<F>, inner_t>>(
+                std::forward<F>(f));
         }
 
         /// 旁观副作用: f 接收 T&(void 任务无参), 不改变结果与错误通道
         template <typename F>
-        auto inspect(this auto&& self, F&& f) -> task<T> {
-            if (!self.st_) [[unlikely]] {
-                return task{}; // 无效任务的组合仍是无效任务
-            }
-            return self.template attach_cont<T, detail::inspect_cont<state_t, std::decay_t<F>>>(
+        task inspect(F&& f) {
+            return attach_cont<T, detail::inspect_cont<state_t, std::decay_t<F>>>(
                 std::forward<F>(f));
         }
 
     private:
-        /// 组合子共用骨架: 建子状态 -> 续延节点 nothrow 分配 -> 挂接
-        /// (父任务已完成则立即内联执行) -> 返回子任务
-        template <typename U, typename NodeT, typename... A>
+        /// 组合子共用骨架: 无效任务的组合仍是无效任务; 否则建子状态 -> 续延
+        /// 节点 nothrow 分配 -> 挂接(父任务已完成则立即内联执行) -> 返回子任务
+        template <typename U, typename Node, typename... A>
         task<U> attach_cont(A&&... a) {
+            if (!st_) [[unlikely]] {
+                return task<U>{};
+            }
             try {
                 auto child = detail::make_state<U>();
-                auto* n = new (std::nothrow) NodeT{{}, child, std::forward<A>(a)...};
+                auto* n = new (std::nothrow) Node{{}, child, std::forward<A>(a)...};
                 if (!n) {
                     return detail::failed_task<U>();
                 }
-                if (!st_->attach(n)) {
-                    n->run(*st_); // 父任务已完成: 立即内联
-                    delete n;
-                }
+                detail::attach_or_run(*st_, n);
                 return task<U>{std::move(child)};
             } catch (...) {
                 return detail::failed_task<U>(); // make_state 的 bad_alloc
@@ -803,7 +723,7 @@ namespace concurrent {
         }
 
     public:
-        std::shared_ptr<detail::shared_state<T>> st_;
+        std::shared_ptr<state_t> st_;
     };
 
     namespace detail {
@@ -830,47 +750,37 @@ namespace concurrent {
         requires((!std::is_void_v<Ts>) && ...)
     [[nodiscard]]
     task<std::tuple<Ts...>> when_all(task<Ts>... ts) {
-        if constexpr (sizeof...(Ts) == 0) {
-            auto st = detail::make_state<std::tuple<>>();
-            st->emplace_value(std::tuple<>{});
-            st->finish();
-            return task<std::tuple<>>{std::move(st)};
-        } else {
-            try {
-                auto dst = detail::make_state<std::tuple<Ts...>>();
+        try {
+            auto dst = detail::make_state<std::tuple<Ts...>>();
+            if constexpr (sizeof...(Ts) == 0) {
+                dst->emplace_value();
+                dst->finish();
+            } else {
                 using core_t = detail::when_all_core<Ts...>;
                 auto core = std::make_shared<core_t>(dst);
-
-                [[maybe_unused]]
-                auto attach_one = [&]<std::size_t I, typename TIn>(
-                                      std::integral_constant<std::size_t, I>, task<TIn>& t) {
-                    if (!t.st_) [[unlikely]] { // 无效入参: 以具名标记沉淀, 不解引用
-                        core->record_error(invalid_task_error());
-                        core->settle_one();
-                        return;
-                    }
-                    using parent_t = detail::shared_state<TIn>;
-                    using node_t = detail::deposit_cont<I, parent_t, core_t>;
-                    auto* n = new (std::nothrow) node_t{{}, core};
-                    if (!n) { // 单槽 OOM 降级为该槽失败, 不放大为整批失败
-                        core->record_error(std::make_exception_ptr(std::bad_alloc{}));
-                        core->settle_one();
-                        return;
-                    }
-                    if (!t.st_->attach(n)) {
-                        n->run(*t.st_); // 已完成: 内联沉淀
-                        delete n;
-                    }
+                auto miss = [&](std::exception_ptr e) {
+                    core->record_error(std::move(e));
+                    core->settle_one();
                 };
-
+                auto attach_one = [&]<std::size_t I>(task<Ts...[I]>& t) {
+                    if (!t.st_) [[unlikely]] {
+                        return miss(invalid_task_error()); // 无效入参: 具名标记沉淀, 不解引用
+                    }
+                    auto* node = new (std::nothrow)
+                        detail::deposit_cont<I, detail::shared_state<Ts...[I]>, core_t>{{}, core};
+                    if (!node) {
+                        // 单槽 OOM 降级为该槽失败, 不放大为整批失败
+                        return miss(std::make_exception_ptr(std::bad_alloc{}));
+                    }
+                    detail::attach_or_run(*t.st_, node);
+                };
                 [&]<std::size_t... I>(std::index_sequence<I...>) {
-                    (attach_one(std::integral_constant<std::size_t, I>{}, ts), ...);
+                    (attach_one.template operator()<I>(ts...[I]), ...);
                 }(std::index_sequence_for<Ts...>{});
-
-                return task<std::tuple<Ts...>>{std::move(dst)};
-            } catch (...) {
-                return detail::failed_task<std::tuple<Ts...>>();
             }
+            return task<std::tuple<Ts...>>{std::move(dst)};
+        } catch (...) {
+            return detail::failed_task<std::tuple<Ts...>>();
         }
     }
 

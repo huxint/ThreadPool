@@ -264,7 +264,7 @@ TEST_SUITE("concurrent.detail") {
     }
 
     struct stub_node {
-        stub_node* next_free = nullptr;
+        stub_node* next = nullptr;
     };
 
     TEST_CASE("node_cache_caps_retention_and_reports_full") {

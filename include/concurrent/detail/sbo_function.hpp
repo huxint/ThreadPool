@@ -1,6 +1,5 @@
 #pragma once
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <new>
 #include <type_traits>
@@ -18,6 +17,11 @@ namespace concurrent::detail {
             /// 从 src 构造到 dst(就地模式移动对象; 堆模式复制指针), 不清空 src 的 vptr
             void (*move)(std::byte* dst, std::byte* src) noexcept;
         };
+
+        /// 就地存储的准入: 尺寸与对齐都落在缓冲内
+        template <typename FD>
+        static constexpr bool inplace =
+            sizeof(FD) <= SboBytes && alignof(FD) <= alignof(std::max_align_t);
 
         template <typename FD>
         static const vtable* inplace_vt() noexcept {
@@ -41,7 +45,7 @@ namespace concurrent::detail {
                 [](std::byte* s) -> R { return (**std::launder(reinterpret_cast<FD**>(s)))(); },
                 [](std::byte* s) noexcept { delete *std::launder(reinterpret_cast<FD**>(s)); },
                 [](std::byte* d, std::byte* s) noexcept {
-                    *reinterpret_cast<FD**>(d) = *reinterpret_cast<FD**>(s);
+                    ::new (static_cast<void*>(d)) FD*(*std::launder(reinterpret_cast<FD**>(s)));
                 },
             };
             return &vt;
@@ -51,21 +55,12 @@ namespace concurrent::detail {
         using result_type = R;
 
         sbo_function() noexcept = default;
-        sbo_function(std::nullptr_t) noexcept {}
 
         template <typename F>
             requires(!std::same_as<std::remove_cvref_t<F>, sbo_function>) &&
                     std::is_invocable_r_v<R, std::decay_t<F>&>
         sbo_function(F&& f) {
-            using FD = std::decay_t<F>;
-            if constexpr (sizeof(FD) <= SboBytes && alignof(FD) <= alignof(std::max_align_t)) {
-                ::new (static_cast<void*>(storage_)) FD(std::forward<F>(f));
-                vt_ = inplace_vt<FD>();
-            } else {
-                FD* p = new FD(std::forward<F>(f)); // bad_alloc 仅在提交边界被捕获
-                ::new (static_cast<void*>(storage_)) FD*(p);
-                vt_ = heap_vt<FD>();
-            }
+            emplace_with([&]() -> std::decay_t<F> { return std::forward<F>(f); });
         }
 
         ~sbo_function() {
@@ -83,9 +78,7 @@ namespace concurrent::detail {
 
         sbo_function& operator=(sbo_function&& other) noexcept {
             if (this != &other) {
-                if (vt_) {
-                    vt_->destroy(storage_);
-                }
+                reset();
                 if ((vt_ = other.vt_)) {
                     vt_->move(storage_, other.storage_);
                     other.vt_ = nullptr;
@@ -113,7 +106,7 @@ namespace concurrent::detail {
             requires std::is_invocable_r_v<R, std::decay_t<std::invoke_result_t<Factory>>&>
         void emplace_with(Factory&& make) {
             using FD = std::decay_t<std::invoke_result_t<Factory>>;
-            if constexpr (sizeof(FD) <= SboBytes && alignof(FD) <= alignof(std::max_align_t)) {
+            if constexpr (inplace<FD>) {
                 ::new (static_cast<void*>(storage_)) FD(std::forward<Factory>(make)());
                 vt_ = inplace_vt<FD>();
             } else {

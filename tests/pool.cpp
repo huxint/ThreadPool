@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -87,6 +89,26 @@ TEST_SUITE("concurrent.pool") {
         REQUIRE(r.has_value());
         CHECK((*r)[0].get().value_or(-1) == 11);
         CHECK((*r)[2].get().value_or(-1) == 13);
+    }
+
+    // 阶段一失败整体回滚: 用户拷贝异常原样透传, 已建节点的状态被终结, 池不悬挂
+    TEST_CASE("submit_each_rolls_back_on_element_copy_throw") {
+        struct explosive {
+            int v;
+            explicit explosive(int x) : v(x) {}
+            explosive(const explosive& o) : v(o.v) {
+                if (v == 3) {
+                    throw std::runtime_error("copy");
+                }
+            }
+        };
+        tu::deadlock_watchdog wd(10s, "submit_each_rolls_back_on_element_copy_throw");
+        pool p({.threads = 2});
+        std::vector<int> in{1, 2, 3, 4};
+        auto elems = in | std::views::transform([](int x) { return explosive{x}; });
+        CHECK_THROWS_AS(static_cast<void>(p.submit_each(elems, [](explosive e) { return e.v; })),
+                        std::runtime_error);
+        p.wait();
     }
 
     TEST_CASE("submit_each_empty_range_no_wake") {
@@ -1029,6 +1051,18 @@ TEST_SUITE("concurrent.pool") {
         CHECK(inline_id == std::this_thread::get_id());
         p.wait();
         CHECK(submitted_ran.load());
+    }
+
+    // 内联分支的异常按直接调用语义传播: 连 bad_alloc 也不折成提交失败
+    TEST_CASE("fork_join_inline_branch_exception_propagates_unchanged") {
+        pool p({.threads = 2});
+        std::atomic<bool> forked{false};
+        CHECK_THROWS_AS(static_cast<void>(p.fork_join(
+                            [&]() noexcept { forked.store(true, std::memory_order_relaxed); },
+                            [] { throw std::bad_alloc{}; })),
+                        std::bad_alloc);
+        p.wait();
+        CHECK(forked.load());
     }
 
     TEST_CASE("fork_join_on_stopped_pool_returns_stopped_and_skips_inline") {

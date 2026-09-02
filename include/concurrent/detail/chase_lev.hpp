@@ -1,5 +1,4 @@
 #pragma once
-#include "concurrent/detail/contract_assert.hpp"
 #include <array>
 #include <atomic>
 #include <bit>
@@ -32,9 +31,7 @@ namespace concurrent::detail {
             if (b - top_.load(std::memory_order_acquire) >= Capacity) {
                 return false;
             }
-            // 索引协议: bottom 仅所有者写 -> 此刻必仍是 b; 通过容量检查即
-            // 槽 b&mask 归本线程独占, bottom 发布前窃取者读不到它
-            CONCURRENT_CONTRACT_ASSERT(bottom_.load(std::memory_order_relaxed) == b);
+            // 通过容量检查即槽 b&mask 归本线程独占: bottom 发布前窃取者读不到它
             slots_[b & mask].store(value, std::memory_order_relaxed);
             // release 发布: 窃取者的 bottom acquire 载入一旦观察到 b+1,
             // 即与本次槽写入建立 happens-before(论文用独立 fence 表达同一
@@ -55,9 +52,6 @@ namespace concurrent::detail {
             std::atomic_thread_fence(std::memory_order_seq_cst); // 与 steal 的 CAS 竞争
             std::size_t t = top_.load(std::memory_order_relaxed);
             if (t <= b) {
-                // 索引协议: bottom 仅所有者写, 上面已回退并存回 b; t ≤ b 即
-                // 槽 b&mask 的归属判定有效(与窃取者的 CAS 决出最后一个元素)
-                CONCURRENT_CONTRACT_ASSERT(bottom_.load(std::memory_order_relaxed) == b);
                 T v = slots_[b & mask].load(std::memory_order_relaxed);
                 if (t == b) { // 最后一个元素: 与窃取者 CAS 决出归属
                     if (!top_.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst,

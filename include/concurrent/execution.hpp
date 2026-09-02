@@ -105,10 +105,6 @@ namespace concurrent::ex {
         friend bool operator==(const pool_scheduler& a, const pool_scheduler& b) noexcept {
             return a.pool_ == b.pool_;
         }
-        [[nodiscard]]
-        friend bool operator!=(const pool_scheduler& a, const pool_scheduler& b) noexcept {
-            return !(a == b);
-        }
 
     private:
         Pool* pool_;

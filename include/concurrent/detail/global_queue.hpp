@@ -18,9 +18,9 @@ namespace concurrent::detail {
      * **永不拒绝, 永不阻塞**: 环满即转入溢出链
      *
      * **为什么溢出链不分配内存**
-     * 溢出链复用节点自身的 `next_q` 指针串成侵入式单链表. 一个节点在任一时刻
-     * 只可能处于"环 / 溢出链 / 空闲链"三者之一, 指针字段互不冲突. 因此
-     * 队列扩容的边际内存开销为零 - 节点本来就存在
+     * 溢出链复用节点自身的 `next` 指针串成侵入式单链表. 一个节点在任一时刻
+     * 只可能处于"环 / 溢出链 / 空闲链"三者之一, 链接字段不会同时被两方使用.
+     * 因此队列扩容的边际内存开销为零 - 节点本来就存在
      *
      * **保序**
      * 严格不变式: **环中元素恒早于溢出链中元素**
@@ -37,12 +37,12 @@ namespace concurrent::detail {
      * 稳态下溢出链恒空, push/pop 全部落在无锁环上, 自旋锁一次也不会被摸到.
      * 只有积压真的超过 RingCap 时才进入加锁路径, 且临界区被 REFILL_BATCH 限长.
      *
-     * @tparam Node    任务节点类型, 须提供 `Node* next_q` 成员
+     * @tparam Node    任务节点类型, 须提供 `Node* next` 成员
      * @tparam RingCap 环容量(2 的幂)
      */
     template <typename Node, std::size_t RingCap>
         requires requires(Node* n) {
-            { n->next_q } -> std::convertible_to<Node*>;
+            { n->next } -> std::convertible_to<Node*>;
         }
     class global_queue {
         /// 单次回填上限: 把自旋锁的临界区钉死在常数时间内
@@ -51,7 +51,7 @@ namespace concurrent::detail {
     public:
         /**
          * @brief 入队. 永不失败, 永不阻塞(不分配内存 -> 无 OOM 出口)
-         * @param n 非空节点; 其 next_q 由本队列接管
+         * @param n 非空节点; 其 next 由本队列接管
          */
         void push(Node* n) noexcept {
             // 快路径: 溢出链空且环有空位
@@ -85,9 +85,9 @@ namespace concurrent::detail {
     private:
         void push_overflow(Node* n) noexcept {
             std::scoped_lock g{lock_};
-            n->next_q = nullptr;
+            n->next = nullptr;
             if (tail_) {
-                tail_->next_q = n;
+                tail_->next = n;
             } else {
                 head_ = n;
             }
@@ -106,8 +106,8 @@ namespace concurrent::detail {
                 return nullptr;
             }
 
-            head_ = first->next_q;
-            first->next_q = nullptr;
+            head_ = first->next;
+            first->next = nullptr;
             std::size_t removed = 1;
 
             // 回填: 让后续 pop 回到无锁环上; 批量上限保证临界区常数时间.
@@ -116,10 +116,10 @@ namespace concurrent::detail {
             // 不得再触碰它; 未发布成功则链指针原样恢复, 链保持完整
             for (std::size_t i = 0; i < REFILL_BATCH && head_; ++i) {
                 Node* n = head_;
-                Node* next = n->next_q;
-                n->next_q = nullptr;
+                Node* next = n->next;
+                n->next = nullptr;
                 if (!ring_.try_push(n)) { // 环又满了(生产者正猛灌), 留在链上
-                    n->next_q = next;
+                    n->next = next;
                     break;
                 }
                 head_ = next;
