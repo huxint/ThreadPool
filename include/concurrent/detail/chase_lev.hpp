@@ -8,7 +8,7 @@
 namespace concurrent::detail {
 
     /// 固定容量 Chase-Lev 工作窃取双端队列(环形缓冲 + 单调递增索引)
-    /// 槽类型必须平凡可拷贝(池内为 task_node*)
+    /// 槽类型为指针(池内为 task_node*)
     ///
     /// 槽以 relaxed 原子量访问, 数据可见性经 bottom 的 release/acquire 对
     /// 传递(见 push); 归属判定完全由 top/bottom 的索引协议完成
@@ -19,8 +19,7 @@ namespace concurrent::detail {
     ///
     /// bottom 端仅所有者操作(LIFO), top 端被窃取者竞争(FIFO)
     template <typename T, std::size_t Capacity>
-        requires(std::has_single_bit(Capacity) && Capacity >= 2 &&
-                 std::is_trivially_copyable_v<T>)
+        requires(std::has_single_bit(Capacity) && Capacity >= 2 && std::is_pointer_v<T>)
     class chase_lev_deque {
         static constexpr std::size_t mask = Capacity - 1;
 

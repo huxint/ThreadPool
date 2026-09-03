@@ -2,6 +2,7 @@
 #include "concurrent/pool.hpp"
 #include "concurrent/task.hpp"
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <exception>
 #include <expected>
@@ -103,8 +104,7 @@ namespace concurrent {
         }
 
         /// 触发整批提交(幂等), 返回首元素迭代器. begin() 即预取首个
-        /// 结果(generator 首次 begin 恢复协程至首个 co_yield),
-        /// 与旧手写迭代器"构造即 fetch"的语义逐位一致
+        /// 结果(generator 首次 begin 恢复协程至首个 co_yield)
         [[nodiscard]]
         iterator begin() {
             gen_.emplace(results());
@@ -165,8 +165,8 @@ namespace concurrent {
                 if constexpr (std::ranges::sized_range<V>) {
                     slots_.reserve(static_cast<std::size_t>(std::ranges::size(range_)));
                 }
-                // GCC 在 -O3 + 消毒器插桩下对 iota_view 范围 for 的已知误报:
-                // 报告编译器内部临时量"可能未初始化", 实际路径恒已构造
+                // GCC 的已知误报(16.2.1 下以 -O3 -fsanitize=address,undefined 复现):
+                // 对本范围 for 报告编译器内部临时量"可能未初始化", 实际路径恒已构造
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
@@ -275,12 +275,11 @@ namespace concurrent {
         template <typename R>
         using chunked_of = std::ranges::chunk_view<std::views::all_t<R&&>>;
 
-        /// 分块: grain == 0 时块大小取池线程数(至少 1)
+        /// 分块: grain == 0 时块大小取池线程数
         template <typename Pool, typename R>
         [[nodiscard]]
         chunked_of<R> chunked(const Pool& p, R&& range, std::size_t grain) {
-            const std::size_t size =
-                grain != 0 ? grain : std::max<std::size_t>(p.thread_count(), 1);
+            const std::size_t size = grain != 0 ? grain : p.thread_count();
             return chunked_of<R>{
                 std::views::all(std::forward<R>(range)),
                 static_cast<std::ranges::range_difference_t<std::views::all_t<R&&>>>(size)};

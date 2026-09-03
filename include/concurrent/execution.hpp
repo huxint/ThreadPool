@@ -31,16 +31,10 @@ namespace concurrent::ex {
 
             void start() & noexcept {
                 auto* self = this;
-                // execute 要求闭包 noexcept: receiver 的 set_value 允许抛出
-                // (P2300 语义), 就地转入错误通道 - 与本库零 throw 契约的边界
-                if (!pool_->execute([self]() noexcept {
-                        try {
-                            stdexec::set_value(std::move(self->rcvr_));
-                        } catch (...) {
-                            stdexec::set_error(std::move(self->rcvr_),
-                                               std::current_exception());
-                        }
-                    })) {
+                // receiver 的完成操作按 P2300 为 noexcept(stdexec 静态断言之),
+                // 故闭包天然满足 execute 的 noexcept 要求
+                if (!pool_->execute(
+                        [self]() noexcept { stdexec::set_value(std::move(self->rcvr_)); })) {
                     // 池已关闭(OOM 同此): 提交被拒不等于完成 - 报停止
                     stdexec::set_stopped(std::move(rcvr_));
                 }

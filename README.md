@@ -38,7 +38,7 @@ ctest --test-dir build          # 测试
 ./build/concurrent_bench        # 基准(--quick 缩减规模)
 ```
 
-库本身零依赖 header-only: 消费方 `add_subdirectory` 后 `target_link_libraries(app PRIVATE concurrent)` 即可, 或直接把 `include/` 加入头文件搜索路径并链接 Threads
+库本身零依赖 header-only: 消费方 `add_subdirectory` 后 `target_link_libraries(app PRIVATE concurrent)` 即可, 或直接把 `include/` 加入头文件搜索路径并链接 Threads, 且 GCC 下须以 `-fcontracts` 编译链接(公共头含契约语法, 缺该 flag 时链接期缺 `handle_contract_violation`)
 
 ```cpp
 #include <concurrent/pool.hpp>

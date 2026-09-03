@@ -2,12 +2,15 @@
 #include <concurrent/concurrent.hpp>
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <numeric>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -67,9 +70,7 @@ TEST_SUITE("concurrent.pool") {
     TEST_CASE("submit_each_maps_elements_and_batches_wake") {
         pool p({.threads = 4});
         std::vector<int> data(1000);
-        for (int i = 0; i < 1000; ++i) {
-            data[static_cast<std::size_t>(i)] = i;
-        }
+        std::iota(data.begin(), data.end(), 0);
 
         auto r = p.submit_each(data, [](int x) { return x * 2; });
         REQUIRE(r.has_value());
@@ -143,7 +144,7 @@ TEST_SUITE("concurrent.pool") {
 
     TEST_CASE("default_ctor_uses_hardware_concurrency") {
         pool p;
-        CHECK(p.thread_count() >= 1);
+        CHECK(p.thread_count() == std::max<std::size_t>(std::jthread::hardware_concurrency(), 1));
         CHECK(p.running());
     }
 
@@ -238,14 +239,19 @@ TEST_SUITE("concurrent.pool") {
             static_cast<void>(
                 p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
         }
+        // 观察者排在 500 个任务之后: 丢弃按入队序进行, 它被取消终结之时整批已被丢弃
+        auto observer = p.submit([] { return 0; });
+        REQUIRE(observer.has_value());
 
         // discard 不等待排空, 但 join worker 前须先放行闸门
-        std::jthread releaser([&g] {
-            std::this_thread::sleep_for(60ms);
-            g.release();
-        });
-        p.shutdown(shutdown_policy::discard);
-        CHECK(ran.load() < 500);
+        std::jthread dropper([&p] { p.shutdown(shutdown_policy::discard); });
+        auto r = observer->get();
+        g.release();
+        dropper.join();
+
+        REQUIRE(!r.has_value());
+        CHECK(is_cancelled(r.error()));
+        CHECK(ran.load() == 0);
     }
 
     TEST_CASE("shutdown_discard_finalizes_queued_task_state") {
@@ -283,10 +289,15 @@ TEST_SUITE("concurrent.pool") {
 
         std::atomic<bool> queued{false};
         std::atomic<bool> release{false};
-        static_cast<void>(p.execute([&p, &queued, &release]() noexcept {
+        std::optional<task<int>> probe;
+        static_cast<void>(p.execute([&]() noexcept {
             // 在 worker 线程上嵌套提交 -> 取回上面那个节点
             for (int i = 0; i < 8; ++i) {
                 static_cast<void>(p.execute([]() noexcept {}));
+            }
+            // 探针排在最后: 丢弃按入队序进行, 它被取消终结之时复用节点已全部被丢弃
+            if (auto t = p.submit([] { return 0; })) {
+                probe.emplace(std::move(*t));
             }
             queued.store(true, std::memory_order_release);
             while (!release.load(std::memory_order_acquire)) {
@@ -296,18 +307,20 @@ TEST_SUITE("concurrent.pool") {
 
         while (!queued.load(std::memory_order_acquire)) {
         }
+        REQUIRE(probe.has_value());
         std::jthread killer([&p] { p.shutdown(shutdown_policy::discard); });
-        std::this_thread::sleep_for(20ms); // 让 drop_all_queued 撞上那些节点
+        auto r = probe->get();
         release.store(true, std::memory_order_release);
         killer.join();
-        CHECK(!p.running());
+        REQUIRE(!r.has_value());
+        CHECK(is_cancelled(r.error()));
     }
 
-    // 回归: 闭包构建失败(实参拷贝抛 bad_alloc)不得泄漏节点, 池保持可用.
+    // 回归: 闭包构建失败(实参拷贝抛 bad_alloc)须报 out_of_memory 且池保持可用.
     // 节点在"闭包构建成功"之后才被取出; 若先取后再构建, 每次失败即永久
     // 漏掉一个 128B 节点(计数分配器实测每次失败净增 +1), 且反复失败会抽干
     // 全局空闲节点池. ASan 构建另行覆盖"半成品节点"的误接行为
-    TEST_CASE("failed_closure_construction_does_not_leak_or_disable_pool") {
+    TEST_CASE("failed_closure_construction_returns_oom_and_keeps_pool_usable") {
         struct throwing_copy {
             int v = 0;
             explicit throwing_copy(int x) : v(x) {}
@@ -333,7 +346,8 @@ TEST_SUITE("concurrent.pool") {
         CHECK(p.running());
     }
 
-    TEST_CASE("shutdown_idempotent") {        pool p({.threads = 2});
+    TEST_CASE("shutdown_idempotent") {
+        pool p({.threads = 2});
         static_cast<void>(p.execute([]() noexcept {}));
         p.shutdown();
         p.shutdown(shutdown_policy::discard);
@@ -376,7 +390,7 @@ TEST_SUITE("concurrent.pool") {
     // load 指令, 实测需上万轮才偶发一次(1200 轮检出率约 1/9), 靠堆轮数不划算 -
     // 其正确性由 worker_main 中"代际先于判据读取"的协议注释与推导保证
     TEST_CASE("shutdown_drain_race_with_submit_no_hang") {
-        tu::deadlock_watchdog wd{60s, "shutdown_drain_race_with_submit_no_hang"};
+        tu::deadlock_watchdog wd(60s, "shutdown_drain_race_with_submit_no_hang");
 #if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
         constexpr int rounds = 200; // 消毒器下单轮成本高一个量级, 相应缩减
 #else
@@ -415,14 +429,14 @@ TEST_SUITE("concurrent.pool") {
     // shutdown(drain) 就必须仍能返回. 若被拒提交也瞬时抬高 pending_,
     // 收敛条件会被无限重置, 生产者与 shutdown 互等
     TEST_CASE("shutdown_returns_while_producers_keep_retrying") {
-        tu::deadlock_watchdog wd{30s, "shutdown_returns_while_producers_keep_retrying"};
+        tu::deadlock_watchdog wd(30s, "shutdown_returns_while_producers_keep_retrying");
         pool p({.threads = 2});
         std::atomic<bool> stop{false};
-        std::jthread prod{[&] {
+        std::jthread prod([&] {
             while (!stop.load(std::memory_order_acquire)) {
                 static_cast<void>(p.execute([]() noexcept {})); // 被拒也继续重试
             }
-        }};
+        });
         std::this_thread::sleep_for(2ms); // 让重试流稳定运转
 
         p.shutdown(shutdown_policy::drain); // 返回即证明活锁已消除
@@ -514,7 +528,9 @@ TEST_SUITE("concurrent.pool") {
 
     TEST_CASE("cooperative_cancel_while_running") {
         pool p({.threads = 2});
-        auto t = p.submit([](std::stop_token tok) {
+        std::atomic<bool> started{false};
+        auto t = p.submit([&started](std::stop_token tok) {
+            started.store(true, std::memory_order_release);
             int spins = 0;
             while (!tok.stop_requested()) {
                 ++spins;
@@ -523,22 +539,28 @@ TEST_SUITE("concurrent.pool") {
             return spins;
         });
         REQUIRE(t.has_value());
-        std::this_thread::sleep_for(20ms);
+        while (!started.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
         t->request_stop();
         CHECK(t->get().has_value()); // 协作退出属正常完成
     }
 
     TEST_CASE("cancellable_execute_returns_stop_source") {
         basic_pool<decltype(cancellable)> p({.threads = 2});
+        std::atomic<bool> started{false};
         std::atomic<bool> observed_stop{false};
-        auto src = p.execute([&observed_stop](std::stop_token tok) noexcept {
+        auto src = p.execute([&started, &observed_stop](std::stop_token tok) noexcept {
+            started.store(true, std::memory_order_release);
             while (!tok.stop_requested()) {
                 std::this_thread::sleep_for(1ms);
             }
             observed_stop.store(true, std::memory_order_release);
         });
         REQUIRE(src.has_value());
-        std::this_thread::sleep_for(20ms);
+        while (!started.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
         src->request_stop();
         p.wait();
         CHECK(observed_stop.load());
@@ -682,8 +704,8 @@ TEST_SUITE("concurrent.pool") {
     // 特性标签组合
 
     TEST_CASE("worker_cap_static_storage_clamps_threads") {
-        basic_pool<decltype(worker_cap<4>)> p({.threads = 4});
-        CHECK(p.thread_count() == std::size_t{4});
+        basic_pool<decltype(worker_cap<1>)> p; // threads = 0 -> hardware_concurrency, 收紧到 1
+        CHECK(p.thread_count() == std::size_t{1});
 
         std::atomic<int> n{0};
         for (int i = 0; i < 100; ++i) {
@@ -766,21 +788,21 @@ TEST_SUITE("concurrent.pool") {
         CHECK(total.load() == producers * each);
     }
 
-    // 全局环缺省容量 1024/层, 提交超量后溢出链接管, 任何时刻都不丢任务
+    // 全局环缺省容量 65536/层, 提交超量后溢出链接管, 任何时刻都不丢任务
     TEST_CASE("global_queue_overflow_no_loss") {
-        constexpr int n = 20000;
+        constexpr std::size_t n = 2 * detail::queue_cap_default_global;
         pool p({.threads = 2});
         tu::gate g;
         g.block_all(p, 2);
 
-        std::atomic<int> done{0};
+        std::atomic<std::size_t> done{0};
         std::jthread releaser([&g] { // 生产者可能背压, 由旁路线程放行闸门
             std::this_thread::sleep_for(80ms);
             g.release();
         });
 
-        int accepted = 0;
-        for (int i = 0; i < n; ++i) {
+        std::size_t accepted = 0;
+        for (std::size_t i = 0; i < n; ++i) {
             if (p.execute([&done]() noexcept { done.fetch_add(1, std::memory_order_relaxed); })) {
                 ++accepted;
             }
@@ -929,8 +951,10 @@ TEST_SUITE("concurrent.pool") {
         fork::go(p, 10, leaves); // 根任务排队(未运行), 共 2^10 = 1024 叶
 
         std::jthread shut([&p] { p.shutdown(shutdown_policy::drain); });
-        std::this_thread::sleep_for(5ms); // stopping_ 已置位而树仍被闸门挡着
-        g.release();                     // 整棵树在停止状态下派生并完成
+        while (p.running()) { // 等到 stopping_ 置位, 此时树仍被闸门挡着
+            std::this_thread::yield();
+        }
+        g.release(); // 整棵树在停止状态下派生并完成
         shut.join();
         CHECK(leaves.load() == 1024);
     }
@@ -950,7 +974,9 @@ TEST_SUITE("concurrent.pool") {
         }));
 
         std::jthread shut([&p] { p.shutdown(shutdown_policy::drain); });
-        std::this_thread::sleep_for(5ms); // stopping_ 已置位, root 仍被闸门挡着
+        while (p.running()) { // 等到 stopping_ 置位, 此时 root 仍被闸门挡着
+            std::this_thread::yield();
+        }
         CHECK(!p.execute([]() noexcept {}).has_value()); // 外部提交被拒
         g.release();
         shut.join();
@@ -978,7 +1004,12 @@ TEST_SUITE("concurrent.pool") {
     // 缓存随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不取).
     // Linux-only 粗粒度冒烟: 百万次外部 execute 后 RSS 增量须低于宽松上界.
     // ASan 构建跳过: quarantine 把已归还内存滞留计费, RSS 不再反映真实滞留
-    TEST_CASE("node_cache_bounded_rss_under_external_execute") {
+#if defined(__linux__) && !defined(__SANITIZE_ADDRESS__)
+    constexpr bool rss_measurable = true;
+#else
+    constexpr bool rss_measurable = false;
+#endif
+    TEST_CASE("node_cache_bounded_rss_under_external_execute" * doctest::skip(!rss_measurable)) {
 #if defined(__linux__) && !defined(__SANITIZE_ADDRESS__)
         auto rss_pages = [] {
             std::FILE* f = std::fopen("/proc/self/statm", "re");
@@ -1014,13 +1045,10 @@ TEST_SUITE("concurrent.pool") {
             const long after = rss_pages();
             REQUIRE(after > 0);
             const long delta_mb = (after - before) * page / (1024 * 1024);
-            // 无上限缓存实测: 4 worker x 百万任务滞留约 120+ MiB(112B 节点
-            // 入 malloc 128 桶); 上界 64 MiB 距满额缓存(4 x 128 KiB)与
-            // 分配器噪声均有充分裕量
+            // 无上限缓存实测: 4 worker x 百万任务滞留约 120+ MiB(每节点 128B);
+            // 上界 64 MiB 距满额缓存(4 x 128 KiB)与分配器噪声均有充分裕量
             CHECK(delta_mb < 64);
         }
-#else
-        static_cast<void>(0); // 非 Linux 或 ASan: 静默跳过
 #endif
     }
 
@@ -1034,8 +1062,9 @@ TEST_SUITE("concurrent.pool") {
                 return;
             }
             const std::size_t mid = lo + (hi - lo) / 2;
-            (void)p.fork_join([&, lo, mid]() noexcept { self(self, lo, mid); },
-                              [&, lo = mid, mid = hi]() noexcept { self(self, lo, mid); });
+            static_cast<void>(
+                p.fork_join([&, lo, mid]() noexcept { self(self, lo, mid); },
+                            [&, lo = mid, mid = hi]() noexcept { self(self, lo, mid); }));
         };
         go(go, 0, n);
         p.wait();
@@ -1046,8 +1075,8 @@ TEST_SUITE("concurrent.pool") {
         pool p({.threads = 2});
         std::atomic<bool> submitted_ran{false};
         std::thread::id inline_id{};
-        (void)p.fork_join([&]() noexcept { submitted_ran.store(true); },
-                          [&] { inline_id = std::this_thread::get_id(); });
+        static_cast<void>(p.fork_join([&]() noexcept { submitted_ran.store(true); },
+                                      [&] { inline_id = std::this_thread::get_id(); }));
         CHECK(inline_id == std::this_thread::get_id());
         p.wait();
         CHECK(submitted_ran.load());
@@ -1070,7 +1099,7 @@ TEST_SUITE("concurrent.pool") {
         p.shutdown(shutdown_policy::discard);
         bool inline_ran = false;
         auto r = p.fork_join([]() noexcept {}, [&] { inline_ran = true; });
-        CHECK(!r);
+        REQUIRE(!r);
         CHECK(r.error() == submit_error::stopped);
         CHECK(!inline_ran);
     }

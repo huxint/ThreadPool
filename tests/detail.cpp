@@ -171,7 +171,6 @@ TEST_SUITE("concurrent.detail") {
 
         mpmc_ring<int*, 512> ring;
         std::vector<int> storage(total);
-        std::atomic<std::size_t> produced{0};
         std::atomic<std::size_t> consumed{0};
 
         std::vector<std::vector<int*>> harvest(consumers);
@@ -183,7 +182,6 @@ TEST_SUITE("concurrent.detail") {
                     while (!ring.try_push(&storage[base + i])) {
                         std::this_thread::yield();
                     }
-                    produced.fetch_add(1, std::memory_order_relaxed);
                 }
             });
         }
@@ -204,7 +202,6 @@ TEST_SUITE("concurrent.detail") {
         ps.clear();
         cs.clear();
 
-        CHECK(produced.load() == total);
         std::vector<int*> all;
         for (auto& v : harvest) {
             all.insert(all.end(), v.begin(), v.end());

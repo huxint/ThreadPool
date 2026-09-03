@@ -29,8 +29,6 @@ namespace concurrent::detail {
         }
     class node_cache {
     public:
-        static constexpr std::size_t capacity = Capacity;
-
         /// 归还一个节点
         /// @return true = 已收入缓存; false = 已满, 调用方须自行销毁该节点
         [[nodiscard]]

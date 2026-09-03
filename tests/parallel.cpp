@@ -31,8 +31,6 @@ TEST_SUITE("concurrent.parallel") {
                 return x;
             });
             CHECK(v.submitted() == std::size_t{0}); // launch 之前无槽位
-            std::this_thread::sleep_for(20ms);      // 给"若已提交"充分的执行窗口
-            CHECK(calls.load() == 0);
         }
         p.wait();
         CHECK(calls.load() == 0);
@@ -101,8 +99,9 @@ TEST_SUITE("concurrent.parallel") {
         auto v = parallel_map(p, data, [&](int) {
             const int cur = concurrent_now.fetch_add(1, std::memory_order_acq_rel) + 1;
             int prev = peak.load(std::memory_order_relaxed);
-            while (cur > prev && !peak.compare_exchange_weak(prev, cur, std::memory_order_relaxed))
-                ;
+            while (cur > prev &&
+                   !peak.compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {
+            }
             std::this_thread::sleep_for(5ms);
             concurrent_now.fetch_sub(1, std::memory_order_acq_rel);
             return 0;
@@ -471,7 +470,7 @@ TEST_SUITE("concurrent.parallel") {
         CHECK(tu::tracked::live.load() == base);
     }
 
-    // ---- 分块入口 ----
+    // 分块入口
 
     // 基本正确性: 每块求和, 块结果按序拼接
     TEST_CASE("chunked_map_sums_blocks") {
@@ -636,8 +635,6 @@ TEST_SUITE("concurrent.parallel") {
             auto v = parallel_for_chunked(
                 p, data, [&calls](auto&&) { calls.fetch_add(1, std::memory_order_relaxed); }, 5);
             CHECK(v.submitted() == std::size_t{0});
-            std::this_thread::sleep_for(20ms);
-            CHECK(calls.load() == 0);
         }
         p.wait();
         CHECK(calls.load() == 0);

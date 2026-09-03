@@ -1,7 +1,6 @@
 // 模块冒烟测试: 证明 `import concurrent.pool;` 真能替代头文件引入
 //
-// 模式示例: 标准库头在前, import 在后(见 concurrent.cppm 顶部"混用须知")
-// 列出的标准库头即库模板实例化所需的完整集合
+// 模式示例: 标准库头在前, import 在后(见 concurrent.cppm 顶部"混用须知"); 下列为本文件所需
 #include <atomic>
 #include <chrono>
 #include <concepts>
@@ -23,20 +22,13 @@
 
 import concurrent.pool;
 
-int check(bool ok) {
-    return ok ? 0 : 1;
-}
-
 int main() {
     concurrent::basic_pool<decltype(concurrent::priority)> p({.threads = 2});
 
     // submit + 结果通道
     auto t = p.submit([](int x) { return x * 2; }, 21);
-    if (auto rc = check(t.has_value()); rc != 0) {
-        return rc;
-    }
-    if (auto rc = check(t->get().value_or(0) == 42); rc != 0) {
-        return rc;
+    if (!t || t->get().value_or(0) != 42) {
+        return 1;
     }
 
     // fire-and-forget(noexcept 强制)

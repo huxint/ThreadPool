@@ -20,7 +20,7 @@ namespace concurrent {
     /// 提交失败的错误类别
     enum class submit_error : std::uint8_t {
         stopped,       ///< 池已关闭, 拒绝新任务
-        out_of_memory, ///< 内部分配失败(库内唯一允许 catch 的位置)
+        out_of_memory, ///< 内部分配失败
     };
 
     /// 被取消任务的错误标记(经 get() 的错误通道返回)
@@ -75,7 +75,6 @@ namespace concurrent {
         return detail::error_as<submit_error>(e);
     }
 
-    /// 任务句柄前向声明
     template <typename T>
     class task;
 
@@ -95,6 +94,8 @@ namespace concurrent {
             /// 同一时刻只在一处, 两种归属共用一个字段
             task_node* next = nullptr;
         };
+        static_assert(sizeof(task_node) == 128,
+                      "task_node must exactly fill the 128B malloc bucket");
 
         /// 续延节点: 任务完成时被内联执行一次的类型擦除回调
         /// 不用虚函数是为了让节点保持平凡布局, 并省去 vptr 与虚析构的间接开销
@@ -137,7 +138,7 @@ namespace concurrent {
         /// shared_ptr 保活, 节点销毁不悬挂
         inline constexpr int cont_depth_limit = 64;
 
-        inline thread_local int cont_depth = 0;
+        inline constinit thread_local int cont_depth = 0;
 
         /// 待重放的 finish 请求: 状态引用 + 类型擦除的 finish 入口
         struct pending_finish {
@@ -155,7 +156,7 @@ namespace concurrent {
         }
 
         /// drain 进行中标志: 重入的排空请求直接返回(见 drain_pending_finishes)
-        inline thread_local bool in_drain = false;
+        inline constinit thread_local bool in_drain = false;
 
         /// 排空待重放队列. 仅最外层 finish 收尾调用; 重入时直接返回 -
         /// 内层 finish 的收尾看见队列非空也无需自己动手, 本循环会继续消费,
@@ -223,11 +224,6 @@ namespace concurrent {
                 std::destroy_at(ptr());
                 live_ = false;
                 return out;
-            }
-
-            [[nodiscard]]
-            bool has_value() const noexcept {
-                return live_;
             }
 
         private:
@@ -346,14 +342,7 @@ namespace concurrent {
             /// 于值槽; 两份句柄并发领取也由此收敛成一次原子交换
             [[nodiscard]]
             bool claim() noexcept {
-                if (consumed_.exchange(true, std::memory_order_relaxed)) {
-                    return false;
-                }
-                if constexpr (std::is_void_v<T>) {
-                    return true;
-                } else {
-                    return value_.has_value();
-                }
+                return !consumed_.exchange(true, std::memory_order_relaxed);
             }
 
             /// 搬走值. @pre claim() 已返回 true. 成员模板延迟实例化, T=void 不成形
@@ -734,6 +723,7 @@ namespace concurrent {
             try {
                 auto st = make_state<T>();
                 st->set_exception(std::make_exception_ptr(std::bad_alloc{}));
+                st->finish();
                 return task<T>{std::move(st)};
             } catch (...) {
                 return task<T>{};

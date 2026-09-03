@@ -24,7 +24,11 @@ int main() {
     auto f2 = p.submit([](int a, int b) { return a + b; }, 10, 20);
 
     if (f1 && f2) {
-        std::println("result: {}, {}", *f1->get(), *f2->get());
+        auto r1 = f1->get();
+        auto r2 = f2->get();
+        if (r1 && r2) {
+            std::println("result: {}, {}", *r1, *r2);
+        }
     }
 
     // 函数式组合子: when_all + map

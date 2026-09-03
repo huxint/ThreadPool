@@ -18,9 +18,9 @@ if(SANITIZER)
     add_link_options(-fsanitize=${SANITIZER},undefined)
 endif()
 
-# Header-only library. 契约语法写在公共头里, 消费方 TU 须以 -fcontracts 才能解析:
-# 经 INTERFACE 注入但仅限 GCC - Clang 无此 flag, 之前被一刀切强制, 完全无法
-# 消费; 契约求值语义不再随之强加, 交由下游自选
+# Header-only library. 公共头含契约语法: 无 -fcontracts 时可编译但链接期缺
+# handle_contract_violation, 故经 INTERFACE 注入该 flag(仅 GCC, Clang 无此选项);
+# 契约求值语义不下发, 由下游自选
 add_library(concurrent INTERFACE)
 target_include_directories(concurrent INTERFACE include)
 target_compile_features(concurrent INTERFACE cxx_std_26)
@@ -30,9 +30,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_link_options(concurrent INTERFACE -fcontracts)
 endif()
 
-# 自有目标的编译面: 警告(收窄到 PRIVATE, 不再全局 add_compile_options,
-# 不波及 taskflow/doctest 等第三方头) + 契约求值语义(自有目标 Debug 下
-# enforce, 其余 ignore; 不挂 INTERFACE, 不随之下发)
+# 自有目标的编译面: 警告仅 PRIVATE(不波及 taskflow/doctest 等第三方头) +
+# 契约求值语义(Debug 下 enforce, 其余 ignore; 不挂 INTERFACE, 不随之下发)
 function(concurrent_own_compile_options tgt)
     target_compile_options(
         ${tgt} PRIVATE -Wall -Wextra -Wshadow

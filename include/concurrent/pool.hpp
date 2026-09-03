@@ -13,13 +13,16 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <concepts>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <inplace_vector>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <ranges>
+#include <stop_token>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -42,11 +45,10 @@ namespace concurrent {
 
     namespace detail {
 
-        /// worker 线程上下文: 身份 + 空闲节点缓存 + 分层本地 deque
+        /// worker 线程上下文: 空闲节点缓存 + 分层本地 deque
         template <std::size_t Levels, std::size_t LocalCap, std::size_t CacheCap>
         struct alignas(64) worker_ctx {
             node_cache<task_node, CacheCap> cache; ///< 仅所有者线程访问, 带上限
-            std::size_t index = 0;
             std::array<chase_lev_deque<task_node*, LocalCap>, Levels> local{};
         };
 
@@ -59,21 +61,26 @@ namespace concurrent {
         inline constinit thread_local std::size_t tls_external_cell = SIZE_MAX;
         inline constinit std::atomic<std::size_t> g_cell_seq{0};
 
+        /// 可提交的 callable: 直接可调用, 或以 std::stop_token 为首参可调用
+        template <typename F, typename... Args>
+        concept submittable =
+            std::invocable<F, Args...> || std::invocable<F, std::stop_token, Args...>;
+
+        template <typename F, typename... Args>
+        inline constexpr bool takes_token_v = std::invocable<F, std::stop_token, Args...>;
+
         /// submit 的结果类型: token 感知调用优先匹配
         template <typename F, typename... Args>
         struct submit_result {
             using type = std::invoke_result_t<F, Args...>;
         };
         template <typename F, typename... Args>
-            requires std::invocable<F, std::stop_token, Args...>
+            requires takes_token_v<F, Args...>
         struct submit_result<F, Args...> {
             using type = std::invoke_result_t<F, std::stop_token, Args...>;
         };
         template <typename F, typename... Args>
         using submit_result_t = typename submit_result<F, Args...>::type;
-
-        template <typename F, typename... Args>
-        inline constexpr bool takes_token_v = std::invocable<F, std::stop_token, Args...>;
 
     } // namespace detail
 
@@ -117,10 +124,7 @@ namespace concurrent {
         static constexpr bool CANCELLABLE_TAG = detail::has_cancellable_v<Flags...>;
         static constexpr int LEVELS = PRIORITY ? 3 : 1;
         static constexpr std::size_t WORKER_CAP = detail::worker_capacity_v<Flags...>;
-        /// 本地 deque / 全局环每层容量, queue_cap<Global, Local> 标签可配(2 的幂).
-        /// 环满自动落入保序溢出链(不拒绝不阻塞), 故容量只影响内存占用与
-        /// 无锁快路径占比, 不影响正确性; 大环吸收多生产者积压, 避免溢出链
-        /// 自旋锁争用(实测降到 8192 会让 8 生产者吞吐掉一半). 缺省 65536 / 256
+        /// 本地 deque / 全局环每层容量, 由 queue_cap<Global, Local> 标签配置(取舍与缺省见 tags.hpp)
         static constexpr std::size_t LOCAL_CAP = detail::queue_local_cap_v<Flags...>;
         static constexpr std::size_t GLOBAL_CAP = detail::queue_global_cap_v<Flags...>;
         static_assert(std::has_single_bit(GLOBAL_CAP),
@@ -140,8 +144,9 @@ namespace concurrent {
         /// 正常运行零触碰
         static constexpr std::int64_t DRAIN_NESTED_BUDGET = 4'000'000;
         static constexpr int PAUSE_BATCH = 16; ///< 每轮探测间的让核步长
+        static constexpr std::size_t MAX_THREADS = 65536;
         /// idle_state_ 的两个计数单位(高 32 位自旋者, 低 32 位睡眠者);
-        /// worker 数上限 65536, 两侧计数均不可能溢出各自的 32 位
+        /// worker 数不超过 MAX_THREADS, 两侧计数均不可能溢出各自的 32 位
         static constexpr std::uint64_t SPINNER_UNIT = std::uint64_t{1} << 32;
         static constexpr std::uint64_t SLEEPER_UNIT = 1;
         /// pending 记账分片数(见 cells_ 声明): 每线程一个单元, 占坑/完成
@@ -174,8 +179,8 @@ namespace concurrent {
         using gq_t = detail::global_queue<node_t, GLOBAL_CAP>;
         using worker_ctx_t = detail::worker_ctx<LEVELS, LOCAL_CAP, NODE_CACHE_CAP>;
         using node_pool_t = detail::mpmc_ring<node_t*, NODE_POOL_CAP>;
-        /// 分片单元: 包装而非对 atomic 直接 alignas(GCC 对已定义类类型
-        /// 忽略该属性), 单元独享缓存行, 分片间的假共享正是要消灭的东西
+        /// 分片单元: std::array 元素无法单独 alignas, 以包装类型承载缓存行
+        /// 对齐, 单元独享缓存行, 分片间的假共享正是要消灭的东西
         struct alignas(64) cell_t {
             std::atomic<std::int64_t> value{0};
         };
@@ -200,10 +205,10 @@ namespace concurrent {
          * 这是全库唯一可能抛出的入口 - 构造期资源获取(worker 上下文分配,
          * 线程创建)失败无法经返回值表达. 需要严格零 throw 时请改用 try_create()
          *
-         * @pre opts.threads ≤ 65536
+         * @pre opts.threads ≤ MAX_THREADS
          * @pre 带 worker_cap<N> 标签时 opts.threads ≤ N
          */
-        explicit basic_pool(options opts = {}) pre(opts.threads <= 65536)
+        explicit basic_pool(options opts = {}) pre(opts.threads <= MAX_THREADS)
             pre(WORKER_CAP == 0 || opts.threads <= WORKER_CAP)
             : hooks_(take_hooks(opts)), spin_budget_(opts.spin_budget) {
             n_threads_ = opts.threads
@@ -218,18 +223,16 @@ namespace concurrent {
             // 队列先于 worker 就位, 且置于 try 之外: 收尾路径(flush_freelists)
             // 要解引用 node_pool_, 只有 worker 已启动的失败才需要那条路径
             ctxs_ = std::make_unique<worker_ctx_t[]>(n_threads_);
-            for (std::size_t i = 0; i < n_threads_; ++i) {
-                ctxs_[i].index = i;
-            }
             node_pool_ = std::make_unique<node_pool_t>();
             globals_ = std::make_unique<std::array<gq_t, LEVELS>>();
             cells_ = std::make_unique<cells_t>();
             try {
                 spawn_workers();
             } catch (...) {
-                // 已就位的 worker 只在看到停止信号后才退出循环; 若跳过这步,
+                // 已就位的 worker 只在看到退出判据后才离场: 先置位并唤醒, 再
+                // join, 最后清空节点缓存, 之后异常方可继续传播; 若跳过这步,
                 // 成员析构中 jthread 的 join 会永久阻塞
-                abort_partial_construction();
+                retire_workers();
                 throw;
             }
         }
@@ -267,8 +270,7 @@ namespace concurrent {
          */
         template <typename F, typename... Args>
             requires(!std::same_as<std::remove_cvref_t<F>, task_priority>) &&
-                    (std::invocable<F, Args...> ||
-                     std::invocable<F, std::stop_token, Args...>) // 不可调用对象在重载处即报, 不再爆在深处
+                    detail::submittable<F, Args...> // 不可调用对象在重载处即报, 而非深入实现后才报
         [[nodiscard]]
         auto submit(F&& f, Args&&... args)
             -> std::expected<task<detail::submit_result_t<F, Args...>>, submit_error> {
@@ -281,8 +283,7 @@ namespace concurrent {
 
         /// 提交带优先级的任务 @requires priority 标签
         template <typename F, typename... Args>
-            requires(PRIORITY) && (std::invocable<F, Args...> ||
-                                   std::invocable<F, std::stop_token, Args...>)
+            requires(PRIORITY) && detail::submittable<F, Args...>
         [[nodiscard]]
         auto submit(task_priority prio, F&& f, Args&&... args)
             -> std::expected<task<detail::submit_result_t<F, Args...>>, submit_error> {
@@ -306,8 +307,7 @@ namespace concurrent {
          */
         template <typename Rng, typename F>
             requires std::ranges::input_range<Rng> &&
-                     (std::invocable<F&, std::ranges::range_value_t<Rng>> ||
-                      std::invocable<F&, std::stop_token, std::ranges::range_value_t<Rng>>)
+                     detail::submittable<F&, std::ranges::range_value_t<Rng>>
         [[nodiscard]]
         auto submit_each(Rng&& rng, F f)
             -> std::expected<std::vector<task<detail::submit_result_t<
@@ -922,9 +922,8 @@ namespace concurrent {
                     return n;
                 }
             }
-            // 跨线程复用: worker 归还的空闲节点经全局池回流转给外部生产者,
-            // 省去每任务一次 malloc + 一次跨线程 free(否则 fire-and-forget
-            // 单生产者吞吐掉约 4 倍)
+            // 跨线程复用: worker 归还的空闲节点经全局池回流给外部生产者,
+            // 取舍见 NODE_POOL_CAP
             if (auto* n = node_pool_->try_pop()) [[likely]] {
                 return n;
             }
@@ -938,23 +937,14 @@ namespace concurrent {
             if (n->discard) {
                 n->discard(n->discard_ctx);
             }
-            n->body.reset();
             delete n;
         }
 
         void spawn_workers() {
             workers_.reserve(n_threads_);
             for (std::size_t i = 0; i < n_threads_; ++i) {
-                workers_.emplace_back(
-                    [this, i](std::stop_token st) { worker_main(i, std::move(st)); });
+                workers_.emplace_back([this, i] { worker_main(i); });
             }
-        }
-
-        /// 构造中途失败的收尾: 先让已启动的 worker 看到停止信号并唤醒它们,
-        /// 再 join, 最后清空节点缓存. 之后异常方可继续传播
-        void abort_partial_construction() noexcept {
-            stopping_.store(true, std::memory_order_seq_cst);
-            retire_workers();
         }
 
         /// 放 worker 离场: 置退出判据 -> 推代际唤醒全部睡眠者 -> jthread 析构
@@ -967,7 +957,7 @@ namespace concurrent {
             flush_freelists();
         }
 
-        void worker_main(std::size_t idx, std::stop_token stop) {
+        void worker_main(std::size_t idx) {
             detail::tls_pool = static_cast<const void*>(this);
             detail::tls_worker = idx;
             std::uint32_t seed = static_cast<std::uint32_t>(idx) * 0x9E3779B9u + 1u;
@@ -1027,14 +1017,10 @@ namespace concurrent {
                 // 此时 drain 还要靠 worker 把队列消费干净. 若以它为退出判据,
                 // worker 会在 shutdown(drain) 的 wait() 期间集体离场, 而"已越过
                 // 拒绝检查"的在途提交随后才落队 -> pending 永不归零, wait() 悬挂
-                //
-                // stop_token 是兜底: jthread 析构会 request_stop 后 join,
-                // 即便某条路径漏了 quitting_ 也不会挂死在 join 上
-                if (quitting_.load(std::memory_order_acquire) || stop.stop_requested())
-                    [[unlikely]] {
+                if (quitting_.load(std::memory_order_acquire)) [[unlikely]] {
                     break;
                 }
-                // 睡前最后一搏用 try_acquire 而非只读的 any_work_hint:
+                // 睡前最后一搏用 try_acquire 而非只读的 more_work_hint:
                 // 扫的还是同一批队列, 但有活直接拿走执行而非"看到却空手
                 // 回去再来一轮", 全空才睡 - 免竞态协议不变(代际已先读).
                 //
@@ -1244,11 +1230,10 @@ namespace concurrent {
         /// pending 记账分片: 每线程一个单元, 占坑 +1 落提交者单元, 完成
         /// -1 落执行者单元, 全体求和即真实在途数(单元可负). 单元独享
         /// 缓存行使占坑/完成零争用(8 生产者饱和下共享行 RMW 是吞吐瓶颈).
-        /// 求和是瞬时快照: 依赖
-        /// 缓存传播而非同步链, 可能读到负值或残差, 故归零只作启发,
-        /// 同步依据是唤醒纪律(complete_one 捷径 + worker 睡前检查 +
-        /// 排空观察)与 Dekker 定序的收敛证明. 堆分配以保持池对象本身
-        /// 可安全栈上构造(16 KiB, 同 globals_ 的理由)
+        /// 求和是瞬时快照: 依赖缓存传播而非同步链, 可能读到负值或残差,
+        /// 故归零只作启发, 同步依据是唤醒纪律(complete_one 捷径 + worker
+        /// 睡前检查 + 排空观察)与 Dekker 定序的收敛证明. 堆分配以保持池
+        /// 对象本身可安全栈上构造(16 KiB, 同 globals_ 的理由)
         std::unique_ptr<cells_t> cells_;
         /// 全局空闲节点池(MPMC 有界环): 外部生产者与 worker 之间的节点流转
         /// 复用. 堆分配以保持池对象本身可安全栈上构造(同 globals_)
@@ -1256,15 +1241,15 @@ namespace concurrent {
         std::conditional_t<WORKER_CAP != 0, std::inplace_vector<std::jthread, WORKER_CAP>,
                            std::vector<std::jthread>>
             workers_;
-        /// 全局环体积随容量线性增长(65536 槽 = 4MiB/层, priority 下三层),
-        /// 堆分配以保持池对象本身可安全栈上构造; 热路径仅多一次指针解引用
+        /// 全局环体积随容量线性增长, 堆分配以保持池对象本身可安全栈上构造;
+        /// 热路径仅多一次指针解引用
         std::unique_ptr<std::array<gq_t, LEVELS>> globals_;
         /// !TRACE 时零尺寸(monostate + [[no_unique_address]]), 三个
         /// move_only_function 槽位不占池对象空间
         [[no_unique_address]] std::conditional_t<TRACE, trace_hooks, std::monostate> hooks_;
         std::size_t n_threads_ = 0;
         /// 睡前忙等预算(options::spin_budget, 构造后只读)
-        std::chrono::microseconds spin_budget_{64};
+        std::chrono::microseconds spin_budget_;
 
         /// 取走 options 里的钩子; 非 trace 池原样丢弃(存储为零尺寸 monostate)
         [[nodiscard]]

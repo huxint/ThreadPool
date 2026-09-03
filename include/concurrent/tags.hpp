@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -97,14 +98,12 @@ namespace concurrent {
         /// 无标签时折叠为 0, 替换为缺省值
         template <typename... Flags>
         inline constexpr std::size_t queue_global_cap_v = [] {
-            std::size_t v = 0uz;
-            ((v = std::max(v, queue_cap_value<Flags>::global)), ...);
+            constexpr std::size_t v = std::max({queue_cap_value<Flags>::global..., 0uz});
             return v != 0 ? v : queue_cap_default_global;
         }();
         template <typename... Flags>
         inline constexpr std::size_t queue_local_cap_v = [] {
-            std::size_t v = 0uz;
-            ((v = std::max(v, queue_cap_value<Flags>::local)), ...);
+            constexpr std::size_t v = std::max({queue_cap_value<Flags>::local..., 0uz});
             return v != 0 ? v : queue_cap_default_local;
         }();
 

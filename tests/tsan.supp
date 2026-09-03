@@ -1,10 +1,10 @@
 # ThreadSanitizer 抑制清单
 #
-# 唯一需要抑制的是 TSan 与 UBSan 同跑时的**运行时自扰**：
-# libubsan 的诊断机制经 libstdc++ 线程创建路径使用内部 pipe，
-# 双方运行库均未按 TSan 语义编译，TSan 将其拦截为 data race。
-# 栈内不含任何项目代码（见 tests/tsan.log 中 pipe/libubsan 帧）。
+# 唯一需要抑制的是 TSan 与 UBSan 同跑时的**运行时自扰**:
+# libubsan 的诊断机制经 libstdc++ 线程创建路径使用内部 pipe,
+# 双方运行库均未按 TSan 语义编译, TSan 将其拦截为 data race.
+# 报告栈顶为 libubsan 的 pipe 写入帧, 不含任何项目帧.
 #
-# 库自身代码零抑制 —— 任何指向 include/concurrent 或 tests 的报告都应视为真实缺陷。
+# 库自身代码零抑制 - 任何指向 include/concurrent 或 tests 的报告都应视为真实缺陷.
 
 race:libubsan

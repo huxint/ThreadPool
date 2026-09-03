@@ -5,9 +5,9 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -330,6 +330,14 @@ TEST_SUITE("concurrent.task") {
         CHECK(!submit_error_of(r.error()).has_value());
         t.wait();         // 不得崩溃
         t.request_stop(); // 不得崩溃
+    }
+
+    // 回归: OOM 出口返回的任务须已发布完成, 否则 get() 在 done 等待上永久阻塞
+    TEST_CASE("failed_task_completes_with_bad_alloc") {
+        tu::deadlock_watchdog wd(10s, "failed_task_completes_with_bad_alloc");
+        auto r = detail::failed_task<int>().get();
+        REQUIRE(!r.has_value());
+        CHECK_THROWS_AS(std::rethrow_exception(r.error()), std::bad_alloc);
     }
 
     // 回归: "结果恰好可取一次"对 task<void> 同样成立. void 没有值可搬走,

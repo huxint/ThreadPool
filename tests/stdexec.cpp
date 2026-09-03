@@ -7,12 +7,9 @@
 
 #include <atomic>
 #include <chrono>
-#include <exception>
-#include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
-#include <tuple>
-#include <utility>
 
 using namespace concurrent;
 
@@ -20,12 +17,6 @@ TEST_SUITE("concurrent.stdexec") {
 
     // scheduler 概念成立(结构化概念, 无需 tag)
     static_assert(stdexec::scheduler<ex::pool_scheduler<pool>>);
-
-    TEST_CASE("scheduler_satisfies_concepts") {
-        pool p({.threads = 2});
-        auto sched = ex::as_scheduler(p);
-        CHECK(stdexec::scheduler<decltype(sched)>);
-    }
 
     TEST_CASE("schedule_then_sync_wait") {
         pool p({.threads = 2});
@@ -45,7 +36,6 @@ TEST_SUITE("concurrent.stdexec") {
         std::atomic<int> hits{0};
         auto work = [&]() -> int {
             hits.fetch_add(1, std::memory_order_relaxed);
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
             return 1;
         };
 
