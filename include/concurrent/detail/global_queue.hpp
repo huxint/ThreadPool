@@ -5,6 +5,7 @@
 #include <concepts>
 #include <cstddef>
 #include <mutex>
+#include <span>
 
 namespace concurrent::detail {
 
@@ -15,7 +16,7 @@ namespace concurrent::detail {
      * 单纯的有界环在满时只有两条出路: 拒绝, 或让生产者阻塞等空槽(背压).
      * 背压会把队列深度直接摊到提交延迟的尾部(P99 爆炸), 并且在 worker 内嵌套
      * 提交时可能自锁 - 所有 worker 都在等空槽, 就没人消费了. 故本队列取
-     * **永不拒绝, 永不阻塞**: 环满即转入溢出链
+     * **不因容量拒绝, 不等待空槽**: 环满即转入溢出链
      *
      * **为什么溢出链不分配内存**
      * 溢出链复用节点自身的 `next` 指针串成侵入式单链表. 一个节点在任一时刻
@@ -50,7 +51,7 @@ namespace concurrent::detail {
 
     public:
         /**
-         * @brief 入队. 永不失败, 永不阻塞(不分配内存 -> 无 OOM 出口)
+         * @brief 入队. 环满时接入溢出链, 不分配内存
          * @param n 非空节点; 其 next 由本队列接管
          */
         void push(Node* n) noexcept {
@@ -74,6 +75,23 @@ namespace concurrent::detail {
                 return nullptr;
             }
             return pop_overflow_and_refill();
+        }
+
+        std::size_t pop_batch(std::span<Node*> out) noexcept {
+            if (out.empty()) {
+                return 0;
+            }
+            if (const auto count = ring_.try_pop_batch(out); count != 0) {
+                return count;
+            }
+            if (overflow_size_.load(std::memory_order_acquire) == 0) {
+                return 0;
+            }
+            if (Node* first = pop_overflow_and_refill()) {
+                out[0] = first;
+                return 1 + ring_.try_pop_batch(out.subspan(1));
+            }
+            return 0;
         }
 
         /// 近似深度(调度启发与观测用, 不作同步依据)

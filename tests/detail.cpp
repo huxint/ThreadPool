@@ -1,4 +1,5 @@
 #include <concurrent/detail/chase_lev.hpp>
+#include <concurrent/detail/global_queue.hpp>
 #include <concurrent/detail/mpmc_ring.hpp>
 #include <concurrent/detail/node_cache.hpp>
 #include <concurrent/detail/sbo_function.hpp>
@@ -24,7 +25,8 @@ TEST_SUITE("concurrent.detail") {
     TEST_CASE("capacity_constraints_reject_zero_and_non_pow2") {
         static_assert(!ring_ok<int*, 0>);
         static_assert(!ring_ok<int*, 3>);
-        static_assert(ring_ok<int*, 1>); // 环允许 1(池级另由缺省/标签兜底)
+        static_assert(!ring_ok<int*, 1>);
+        static_assert(ring_ok<int*, 2>);
         static_assert(ring_ok<int*, 8>);
 
         static_assert(!deque_ok<int*, 0>);
@@ -189,12 +191,20 @@ TEST_SUITE("concurrent.detail") {
         for (int t = 0; t < consumers; ++t) {
             cs.emplace_back([&, t] {
                 auto& out = harvest[static_cast<std::size_t>(t)];
+                std::array<int*, 8> batch;
                 while (consumed.load(std::memory_order_acquire) < total) {
-                    if (int* p = ring.try_pop()) {
-                        out.push_back(p);
-                        consumed.fetch_add(1, std::memory_order_release);
-                    } else {
+                    std::size_t count = 0;
+                    if (t % 2 == 0) {
+                        count = ring.try_pop_batch(batch);
+                    } else if (int* p = ring.try_pop()) {
+                        batch[0] = p;
+                        count = 1;
+                    }
+                    if (count == 0) {
                         std::this_thread::yield();
+                    } else {
+                        out.insert(out.end(), batch.begin(), batch.begin() + count);
+                        consumed.fetch_add(count, std::memory_order_release);
                     }
                 }
             });
@@ -207,6 +217,44 @@ TEST_SUITE("concurrent.detail") {
             all.insert(all.end(), v.begin(), v.end());
         }
         CHECK(exactly_once(all, storage, total));
+    }
+
+    TEST_CASE("mpmc_ring_batch_preserves_fifo_across_wraparound") {
+        mpmc_ring<int*, 4> ring;
+        std::array<int, 5> values{1, 2, 3, 4, 5};
+        REQUIRE(ring.try_push(&values[0]));
+        REQUIRE(ring.try_push(&values[1]));
+        REQUIRE(ring.try_push(&values[2]));
+        std::array<int*, 2> first{};
+
+        REQUIRE(ring.try_pop_batch(first) == 2);
+        CHECK(first == std::array{&values[0], &values[1]});
+        REQUIRE(ring.try_push(&values[3]));
+        REQUIRE(ring.try_push(&values[4]));
+        std::array<int*, 4> rest{};
+
+        REQUIRE(ring.try_pop_batch(rest) == 3);
+        CHECK(rest == std::array<int*, 4>{&values[2], &values[3], &values[4], nullptr});
+        CHECK(ring.try_pop_batch(rest) == 0);
+    }
+
+    TEST_CASE("global_queue_batch_drains_overflow_in_order") {
+        struct node {
+            node* next = nullptr;
+        };
+        std::array<node, 5> nodes;
+        global_queue<node, 2> queue;
+        for (auto& value : nodes) {
+            queue.push(&value);
+        }
+        std::array<node*, 4> batch;
+        std::vector<node*> received;
+
+        while (const auto count = queue.pop_batch(batch)) {
+            received.insert(received.end(), batch.begin(), batch.begin() + count);
+        }
+
+        CHECK(received == std::vector{&nodes[0], &nodes[1], &nodes[2], &nodes[3], &nodes[4]});
     }
 
     TEST_CASE("sbo_function_inplace_heap_and_move") {

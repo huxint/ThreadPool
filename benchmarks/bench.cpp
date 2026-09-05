@@ -20,16 +20,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <format>
 #include <functional>
-#include <mutex>
 #include <optional>
 #include <print>
 #include <random>
+#include <semaphore>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -45,12 +47,21 @@
 //   带结果统一走各自的 async / submit
 // - 递归派生统一 work-first 形态(一支内联, 一支入队; TBB 行与本库行同款),
 //   以深度优先的缓存局部性代表各自的最佳实践
-// - 完成判定统一采用任务内计数器 + 主线程自旋等待, 不依赖任何一方的等待原语
+// - 预热后计时, 池与生产者线程的创建、销毁均在吞吐计时之外
+// - 任务体含共享原子完成计数器; 结果包含该争用成本
 namespace {
 
     using clk = std::chrono::steady_clock;
     constexpr int NAME_W = 28;
     constexpr int COL_W = 14;
+
+    template <typename Outcome>
+    void require_success(const Outcome& outcome) noexcept {
+        if (!outcome) [[unlikely]] {
+            std::fputs("benchmark operation failed\n", stderr);
+            std::abort();
+        }
+    }
 
     // 计时: 返回多轮中的最短耗时
     template <typename Fn>
@@ -67,6 +78,13 @@ namespace {
         return best;
     }
 
+    template <typename MakePool, typename Workload>
+    double best_pool_seconds(std::size_t reps, MakePool make_pool, Workload workload) {
+        auto pool = make_pool();
+        workload(pool);
+        return best_seconds(reps, [&] { workload(pool); });
+    }
+
     // 统一完成判据: 自旋直至计数器达到期望值
     void wait_count(const std::atomic<std::size_t>& c, std::size_t expect) {
         while (c.load(std::memory_order_acquire) < expect) {
@@ -79,23 +97,35 @@ namespace {
         return static_cast<double>(count) / secs / 1e6;
     }
 
-    // fire-and-forget 吞吐的统一骨架: 建池后 producers 个生产者线程各灌入
-    // per_producer 个任务, join 生产者, 自旋等待全部完成; 取多轮最优秒数
     template <typename MakePool, typename Produce>
     double fire_secs(std::size_t reps, std::size_t producers, std::size_t per_producer,
                      MakePool make_pool, Produce produce) {
-        return best_seconds(reps, [&] {
-            auto p = make_pool();
-            std::atomic<std::size_t> n{0};
-            {
-                std::vector<std::jthread> ts;
-                ts.reserve(producers);
-                for (std::size_t t = 0; t < producers; ++t) {
-                    ts.emplace_back([&] { produce(p, n, per_producer); });
+        auto pool = make_pool();
+        std::atomic<std::size_t> completed{0};
+        std::barrier start(static_cast<std::ptrdiff_t>(producers + 1));
+        std::barrier submitted(static_cast<std::ptrdiff_t>(producers + 1));
+        std::vector<std::jthread> threads;
+        for (std::size_t i = 0; i < producers; ++i) {
+            threads.emplace_back([&] {
+                for (std::size_t round = 0; round <= reps; ++round) {
+                    start.arrive_and_wait();
+                    produce(pool, completed, per_producer);
+                    submitted.arrive_and_wait();
                 }
-            } // join 生产者
-            wait_count(n, producers * per_producer);
-        });
+            });
+        }
+        double best = 1e18;
+        for (std::size_t round = 0; round <= reps; ++round) {
+            const auto began = clk::now();
+            start.arrive_and_wait();
+            submitted.arrive_and_wait();
+            wait_count(completed, (round + 1) * producers * per_producer);
+            const double seconds = std::chrono::duration<double>(clk::now() - began).count();
+            if (round != 0) {
+                best = std::min(best, seconds);
+            }
+        }
+        return best;
     }
 
     void section(std::string_view title) {
@@ -146,76 +176,74 @@ namespace {
     struct tf_fork {
         static void go(tf::Executor& ex, std::atomic<std::size_t>& leaves, std::size_t d) {
             if (d == 0) {
-                leaves.fetch_add(1, std::memory_order_relaxed);
+                leaves.fetch_add(1, std::memory_order_release);
                 return;
             }
-            for (int i = 0; i < 2; ++i) {
-                ex.silent_async([&ex, &leaves, d] { go(ex, leaves, d - 1); });
-            }
+            ex.silent_async([&ex, &leaves, d] { go(ex, leaves, d - 1); });
+            go(ex, leaves, d - 1);
         }
     };
     struct bs_fork {
         using pool_t = BS::thread_pool<>;
         static void go(pool_t& p, std::atomic<std::size_t>& leaves, std::size_t d) {
             if (d == 0) {
-                leaves.fetch_add(1, std::memory_order_relaxed);
+                leaves.fetch_add(1, std::memory_order_release);
                 return;
             }
-            for (int i = 0; i < 2; ++i) {
-                p.detach_task([&p, &leaves, d] { go(p, leaves, d - 1); });
-            }
+            p.detach_task([&p, &leaves, d] { go(p, leaves, d - 1); });
+            go(p, leaves, d - 1);
         }
     };
     struct cf_fork {
         using pool_t = concurrent::pool;
         static void go(pool_t& p, std::atomic<std::size_t>& leaves, std::size_t d) noexcept {
             if (d == 0) {
-                leaves.fetch_add(1, std::memory_order_relaxed);
+                leaves.fetch_add(1, std::memory_order_release);
                 return;
             }
             // work-first: 一支入队供窃取, 一支内联沿深度优先(与扩展
             // 基线中 TBB 行的派生形态同款)
-            static_cast<void>(p.fork_join([&p, &leaves, d]() noexcept { go(p, leaves, d - 1); },
-                                          [&p, &leaves, d]() noexcept { go(p, leaves, d - 1); }));
+            require_success(p.fork_join([&p, &leaves, d]() noexcept { go(p, leaves, d - 1); },
+                                        [&p, &leaves, d]() noexcept { go(p, leaves, d - 1); }));
         }
     };
 
-    // moodycamel 队列 + 标准 CV 唤醒的自建池: 代表"最佳通用无锁队列"这一档.
-    // std::function 与 BS::thread_pool 同档(通用池的惯用路径), 队列才是变量
+    // semaphore 保存工作通知, 使空队列到入睡之间的提交也能被认领.
     class mcq_pool {
     public:
         explicit mcq_pool(std::size_t n) {
             workers_.reserve(n);
             for (std::size_t i = 0; i < n; ++i) {
-                workers_.emplace_back([this](std::stop_token st) { run(st); });
+                workers_.emplace_back([this] { run(); });
             }
         }
         ~mcq_pool() {
             stop_.store(true, std::memory_order_release);
-            cv_.notify_all();
+            ready_.release(static_cast<std::ptrdiff_t>(workers_.size()));
         }
         void enqueue(std::function<void()> f) {
-            q_.enqueue(std::move(f));
-            cv_.notify_one();
+            if (!q_.enqueue(std::move(f))) {
+                std::abort();
+            }
+            ready_.release();
         }
 
     private:
-        void run(std::stop_token st) {
+        void run() {
             std::function<void()> f;
-            while (!stop_.load(std::memory_order_acquire) && !st.stop_requested()) {
-                if (q_.try_dequeue(f)) {
-                    f();
-                    continue;
+            while (true) {
+                ready_.acquire();
+                if (stop_.load(std::memory_order_acquire)) {
+                    return;
                 }
-                std::unique_lock lk{mtx_};
-                cv_.wait_for(lk, std::chrono::microseconds(200), [&] {
-                    return stop_.load(std::memory_order_acquire) || st.stop_requested();
-                });
+                while (!q_.try_dequeue(f)) {
+                    std::this_thread::yield();
+                }
+                f();
             }
         }
         moodycamel::ConcurrentQueue<std::function<void()>> q_{};
-        std::mutex mtx_;
-        std::condition_variable cv_;
+        std::counting_semaphore<> ready_{0};
         std::atomic<bool> stop_{false};
         std::vector<std::jthread> workers_;
     };
@@ -223,12 +251,11 @@ namespace {
     struct mcq_fork {
         static void go(mcq_pool& p, std::atomic<std::size_t>& leaves, std::size_t d) {
             if (d == 0) {
-                leaves.fetch_add(1, std::memory_order_relaxed);
+                leaves.fetch_add(1, std::memory_order_release);
                 return;
             }
-            for (int i = 0; i < 2; ++i) {
-                p.enqueue([&p, &leaves, d] { go(p, leaves, d - 1); });
-            }
+            p.enqueue([&p, &leaves, d] { go(p, leaves, d - 1); });
+            go(p, leaves, d - 1);
         }
     };
 
@@ -242,12 +269,18 @@ namespace {
         Pool p(std::move(o));
 
         std::atomic<std::size_t> n{0};
+        constexpr std::size_t warmup = 32768;
+        for (std::size_t i = 0; i < warmup; ++i) {
+            require_success(
+                p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_release); }));
+        }
+        wait_count(n, warmup);
         const auto t0 = clk::now();
         for (std::size_t i = 0; i < count; ++i) {
-            static_cast<void>(
-                p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
+            require_success(
+                p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_release); }));
         }
-        wait_count(n, count);
+        wait_count(n, warmup + count);
 
         const double secs = std::chrono::duration<double>(clk::now() - t0).count();
         return secs > 0 ? mops(count, secs) : 0.0;
@@ -270,18 +303,18 @@ int main(int argc, char** argv) {
     const auto make_ours = [&] { return pool({.threads = threads}); };
     const auto produce_tf = [](auto& ex, auto& n, std::size_t cnt) {
         for (std::size_t i = 0; i < cnt; ++i) {
-            ex.silent_async([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+            ex.silent_async([&n] { n.fetch_add(1, std::memory_order_release); });
         }
     };
     const auto produce_bs = [](auto& p, auto& n, std::size_t cnt) {
         for (std::size_t i = 0; i < cnt; ++i) {
-            p.detach_task([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+            p.detach_task([&n] { n.fetch_add(1, std::memory_order_release); });
         }
     };
     const auto produce_ours = [](auto& p, auto& n, std::size_t cnt) {
         for (std::size_t i = 0; i < cnt; ++i) {
-            static_cast<void>(
-                p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
+            require_success(
+                p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_release); }));
         }
     };
 
@@ -308,28 +341,27 @@ int main(int argc, char** argv) {
     {
         const std::size_t count = 200'000 / scale;
 
-        const double tf = mops(count, best_seconds(reps, [&] {
-            tf::Executor ex(threads);
+        const double tf = mops(count, best_pool_seconds(reps, make_tf, [&](auto& ex) {
             long sum = 0;
             for (std::size_t i = 0; i < count; ++i) {
                 sum += ex.async([] { return 1; }).get();
             }
             if (sum != static_cast<long>(count)) {
                 std::println("!! Taskflow result verification failed");
+                std::abort();
             }
         }));
-        const double bs = mops(count, best_seconds(reps, [&] {
-            BS::thread_pool p(threads);
+        const double bs = mops(count, best_pool_seconds(reps, make_bs, [&](auto& p) {
             long sum = 0;
             for (std::size_t i = 0; i < count; ++i) {
                 sum += p.submit_task([] { return 1; }).get();
             }
             if (sum != static_cast<long>(count)) {
                 std::println("!! BS result verification failed");
+                std::abort();
             }
         }));
-        const double ours = mops(count, best_seconds(reps, [&] {
-            pool p({.threads = threads});
+        const double ours = mops(count, best_pool_seconds(reps, make_ours, [&](auto& p) {
             long sum = 0;
             for (std::size_t i = 0; i < count; ++i) {
                 if (auto t = p.submit([] { return 1; })) {
@@ -338,6 +370,7 @@ int main(int argc, char** argv) {
             }
             if (sum != static_cast<long>(count)) {
                 std::println("!! concurrent result verification failed");
+                std::abort();
             }
         }));
         throughput_row("submit/fetch one by one", tf, bs, ours);
@@ -351,20 +384,17 @@ int main(int argc, char** argv) {
         const std::size_t depth = fork_depth(quick);
         const std::size_t leaves_expect = std::size_t{1} << depth;
 
-        const double tf = mops(leaves_expect, best_seconds(reps, [&] {
-            tf::Executor ex(threads);
+        const double tf = mops(leaves_expect, best_pool_seconds(reps, make_tf, [&](auto& ex) {
             std::atomic<std::size_t> leaves{0};
             tf_fork::go(ex, leaves, depth);
             wait_count(leaves, leaves_expect);
         }));
-        const double bs = mops(leaves_expect, best_seconds(reps, [&] {
-            bs_fork::pool_t p(threads);
+        const double bs = mops(leaves_expect, best_pool_seconds(reps, make_bs, [&](auto& p) {
             std::atomic<std::size_t> leaves{0};
             bs_fork::go(p, leaves, depth);
             wait_count(leaves, leaves_expect);
         }));
-        const double ours = mops(leaves_expect, best_seconds(reps, [&] {
-            cf_fork::pool_t p({.threads = threads});
+        const double ours = mops(leaves_expect, best_pool_seconds(reps, make_ours, [&](auto& p) {
             std::atomic<std::size_t> leaves{0};
             cf_fork::go(p, leaves, depth);
             wait_count(leaves, leaves_expect);
@@ -427,9 +457,9 @@ int main(int argc, char** argv) {
         const latency bs = roundtrip(
             make_bs, [](auto& p) { static_cast<void>(p.submit_task([] { return 0; }).get()); });
         const latency ours = roundtrip(make_ours, [](auto& p) {
-            if (auto t = p.submit([] { return 0; })) {
-                static_cast<void>(t->get());
-            }
+            auto t = p.submit([] { return 0; });
+            require_success(t);
+            require_success(t->get());
         });
 
         std::println("{:<{}} {:>{}} {:>{}} {:>{}}", "quantile", NAME_W, "Taskflow", COL_W, "BS",
@@ -458,42 +488,30 @@ int main(int argc, char** argv) {
         const auto body = [](unsigned char kind, auto& done) {
             volatile double sink = spin_work(kind == 0 ? SHORT_ITERS : LONG_ITERS);
             static_cast<void>(sink);
-            done.fetch_add(1, std::memory_order_relaxed);
+            done.fetch_add(1, std::memory_order_release);
         };
 
-        const double tf =
-            best_seconds(reps,
-                         [&] {
-                             tf::Executor ex(threads);
-                             std::atomic<std::size_t> n{0};
-                             for (auto kind : plan) {
-                                 ex.silent_async([&n, kind, &body] { body(kind, n); });
-                             }
-                             wait_count(n, total);
-                         }) *
-            1e3;
-        const double bs = best_seconds(reps,
-                                       [&] {
-                                           BS::thread_pool p(threads);
-                                           std::atomic<std::size_t> n{0};
-                                           for (auto kind : plan) {
-                                               p.detach_task([&n, kind, &body] { body(kind, n); });
-                                           }
-                                           wait_count(n, total);
-                                       }) *
-                          1e3;
-        const double ours =
-            best_seconds(reps,
-                         [&] {
-                             pool p({.threads = threads});
-                             std::atomic<std::size_t> n{0};
-                             for (auto kind : plan) {
-                                 static_cast<void>(
-                                     p.execute([&n, kind, &body]() noexcept { body(kind, n); }));
-                             }
-                             wait_count(n, total);
-                         }) *
-            1e3;
+        const double tf = best_pool_seconds(reps, make_tf, [&](auto& ex) {
+            std::atomic<std::size_t> n{0};
+            for (auto kind : plan) {
+                ex.silent_async([&n, kind, &body] { body(kind, n); });
+            }
+            wait_count(n, total);
+        }) * 1e3;
+        const double bs = best_pool_seconds(reps, make_bs, [&](auto& p) {
+            std::atomic<std::size_t> n{0};
+            for (auto kind : plan) {
+                p.detach_task([&n, kind, &body] { body(kind, n); });
+            }
+            wait_count(n, total);
+        }) * 1e3;
+        const double ours = best_pool_seconds(reps, make_ours, [&](auto& p) {
+            std::atomic<std::size_t> n{0};
+            for (auto kind : plan) {
+                require_success(p.execute([&n, kind, &body]() noexcept { body(kind, n); }));
+            }
+            wait_count(n, total);
+        }) * 1e3;
         time_row("90% short + 10% long", tf, bs, ours);
     }
 
@@ -506,19 +524,17 @@ int main(int argc, char** argv) {
         const auto chunk_body = [](auto& done) {
             volatile double sink = spin_work(LONG_ITERS);
             static_cast<void>(sink);
-            done.fetch_add(1, std::memory_order_relaxed);
+            done.fetch_add(1, std::memory_order_release);
         };
         const auto load = [&](std::size_t t, auto make_pool, auto submit_chunk) {
-            return best_seconds(reps,
-                                [&] {
-                                    auto p = make_pool(t);
-                                    std::atomic<std::size_t> done{0};
-                                    for (std::size_t i = 0; i < chunks; ++i) {
-                                        submit_chunk(p, done);
-                                    }
-                                    wait_count(done, chunks);
-                                }) *
-                   1e3;
+            return best_pool_seconds(reps, [&] { return make_pool(t); },
+                                     [&](auto& p) {
+                                         std::atomic<std::size_t> done{0};
+                                         for (std::size_t i = 0; i < chunks; ++i) {
+                                             submit_chunk(p, done);
+                                         }
+                                         wait_count(done, chunks);
+                                     }) * 1e3;
         };
 
         std::size_t shown = 0; // threads 与列表前几项重合时跳过重复行
@@ -540,7 +556,7 @@ int main(int argc, char** argv) {
             const double ours = load(
                 t, [](std::size_t n) { return pool({.threads = n}); },
                 [&](auto& p, auto& done) {
-                    static_cast<void>(
+                    require_success(
                         p.execute([&done, chunk_body]() noexcept { chunk_body(done); }));
                 });
             time_row(std::format("{} threads", t), tf, bs, ours);
@@ -600,8 +616,8 @@ int main(int argc, char** argv) {
             std::println("{:<{}} {:>12.2f} {:>11.2f}x", r.name, NAME_W, r.mops,
                          base > 0 ? r.mops / base : 0.0);
         }
-        std::println("note: trace hooks are compile-time switches; with no hook set only a branch remains;"
-                     " the on_end row includes one virtual dispatch");
+        std::println("note: trace includes task-ID bookkeeping and hook checks;"
+                     " on_end adds an indirect call");
     }
 
     // 本库独有设施展示: 惰性并行批量端到端
@@ -609,15 +625,11 @@ int main(int argc, char** argv) {
     section("lazy batch: parallel_map end-to-end (ms, lower is better)");
     {
         std::vector<std::uint64_t> data(quick ? 64 : 512, LONG_ITERS);
-        const double ours =
-            best_seconds(reps,
-                         [&] {
-                             pool p({.threads = threads});
-                             auto v = concurrent::parallel_map(
-                                 p, data, [](std::uint64_t k) { return spin_work(k); });
-                             static_cast<void>(v.run());
-                         }) *
-            1e3;
+        const double ours = best_pool_seconds(reps, make_ours, [&](auto& p) {
+            auto v = concurrent::parallel_map(
+                p, data, [](std::uint64_t k) { return spin_work(k); });
+            require_success(v.run());
+        }) * 1e3;
         std::println("{:<{}} {:>14.2f}", "parallel_map full run", NAME_W, ours);
     }
 
@@ -629,14 +641,14 @@ int main(int argc, char** argv) {
         const auto make_mcq = [&] { return mcq_pool(threads); };
         const auto produce_mcq = [](auto& p, auto& n, std::size_t cnt) {
             for (std::size_t i = 0; i < cnt; ++i) {
-                p.enqueue([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+                p.enqueue([&n] { n.fetch_add(1, std::memory_order_release); });
             }
         };
 #ifdef CONCURRENT_BENCH_TBB
-        const auto make_tbb = [&] { return tbb::task_arena(static_cast<int>(threads)); };
+        const auto make_tbb = [&] { return tbb::task_arena(static_cast<int>(threads), 0); };
         const auto produce_tbb = [](auto& arena, auto& n, std::size_t cnt) {
             for (std::size_t i = 0; i < cnt; ++i) {
-                arena.enqueue([&n] { n.fetch_add(1, std::memory_order_relaxed); });
+                arena.enqueue([&n] { n.fetch_add(1, std::memory_order_release); });
             }
         };
 #else
@@ -687,14 +699,13 @@ int main(int argc, char** argv) {
             const std::size_t leaves_expect = std::size_t{1} << depth;
             std::optional<double> tbb;
 #ifdef CONCURRENT_BENCH_TBB
-            tbb = mops(leaves_expect, best_seconds(reps, [&] {
-                tbb::task_arena arena(static_cast<int>(threads));
+            tbb = mops(leaves_expect, best_pool_seconds(reps, make_tbb, [&](auto& arena) {
                 std::atomic<std::size_t> leaves{0};
                 arena.execute([&] {
                     tbb::task_group tg;
                     auto go = [&](auto&& self, std::size_t d) -> void {
                         if (d == 0) {
-                            leaves.fetch_add(1, std::memory_order_relaxed);
+                            leaves.fetch_add(1, std::memory_order_release);
                             return;
                         }
                         tg.run([&, d] { self(self, d - 1); });
@@ -706,14 +717,12 @@ int main(int argc, char** argv) {
                 wait_count(leaves, leaves_expect);
             }));
 #endif
-            const double mcq = mops(leaves_expect, best_seconds(reps, [&] {
-                mcq_pool p(threads);
+            const double mcq = mops(leaves_expect, best_pool_seconds(reps, make_mcq, [&](auto& p) {
                 std::atomic<std::size_t> leaves{0};
                 mcq_fork::go(p, leaves, depth);
                 wait_count(leaves, leaves_expect);
             }));
-            const double ours = mops(leaves_expect, best_seconds(reps, [&] {
-                pool p({.threads = threads});
+            const double ours = mops(leaves_expect, best_pool_seconds(reps, make_ours, [&](auto& p) {
                 std::atomic<std::size_t> leaves{0};
                 cf_fork::go(p, leaves, depth);
                 wait_count(leaves, leaves_expect);
@@ -730,8 +739,7 @@ int main(int argc, char** argv) {
                          COL_W, "vs TBB");
             std::optional<double> tbb;
 #ifdef CONCURRENT_BENCH_TBB
-            tbb = best_seconds(reps, [&] {
-                      tbb::task_arena arena(static_cast<int>(threads));
+            tbb = best_pool_seconds(reps, make_tbb, [&](auto& arena) {
                       arena.execute([&] {
                           tbb::parallel_for(tbb::blocked_range<std::size_t>(0, data.size(), 64),
                                             [&](const tbb::blocked_range<std::size_t>& r) {
@@ -746,8 +754,7 @@ int main(int argc, char** argv) {
                   }) *
                   1e3;
 #endif
-            const double ours = best_seconds(reps, [&] {
-                                    pool p({.threads = threads});
+            const double ours = best_pool_seconds(reps, make_ours, [&](auto& p) {
                                     auto v = concurrent::parallel_map_chunked(
                                         p, data,
                                         [](auto&& chunk) {
@@ -759,11 +766,11 @@ int main(int argc, char** argv) {
                                             static_cast<void>(sink);
                                         },
                                         64);
-                                    static_cast<void>(v.run());
+                                    require_success(v.run());
                                 }) *
                                 1e3;
             const std::string ratio =
-                tbb && *tbb > 0 ? std::format("{:.2f}x", ours / *tbb) : std::string("n/a");
+                tbb && ours > 0 ? std::format("{:.2f}x", *tbb / ours) : std::string("n/a");
             std::println("{:<{}} {:>{}} {:>{}.2f} {:>9}", "parallel map x64 chunks", NAME_W,
                          cell(tbb), COL_W, ours, COL_W, ratio);
         }

@@ -3,6 +3,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -472,6 +473,124 @@ TEST_SUITE("concurrent.pool") {
         CHECK(p.wait_for(0ms));
     }
 
+    TEST_CASE("wait_for_keeps_running_parent_pending") {
+        tu::deadlock_watchdog watchdog(30s, "wait_for_keeps_running_parent_pending");
+        pool p({.threads = 8});
+        tu::gate started;
+        std::atomic<bool> finish{false};
+        std::atomic<int> children{0};
+        const std::array<int, 8> roots{};
+        auto parents = p.submit_each(roots, [&](int) {
+            started.arrived.fetch_add(1, std::memory_order_release);
+            while (!started.open.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            // 父任务在扫描顺序的首个 worker, 子任务由后面的 worker 完成.
+            if (detail::tls_worker != 0) {
+                return;
+            }
+            while (!finish.load(std::memory_order_acquire)) {
+                auto child = p.submit([&] { children.fetch_add(1, std::memory_order_release); });
+                if (!child) {
+                    std::abort();
+                }
+                child->wait();
+            }
+        });
+        REQUIRE(parents.has_value());
+        while (started.arrived.load(std::memory_order_acquire) != 8) {
+            std::this_thread::yield();
+        }
+        started.release();
+        while (children.load(std::memory_order_acquire) < 32) {
+            std::this_thread::yield();
+        }
+
+        bool returned_early = false;
+        for (int i = 0; i < 100'000 && !returned_early; ++i) {
+            returned_early = p.wait_for(0ns);
+        }
+        finish.store(true, std::memory_order_release);
+        for (auto& parent : *parents) {
+            parent.wait();
+        }
+        p.wait();
+
+        CHECK_FALSE(returned_early);
+    }
+
+    TEST_CASE("wait_for_includes_callable_cleanup") {
+        tu::deadlock_watchdog watchdog(30s, "wait_for_includes_callable_cleanup");
+        pool p({.threads = 1});
+        tu::gate cleanup;
+        struct capture {
+            tu::gate& gate;
+            ~capture() {
+                gate.arrived.fetch_add(1, std::memory_order_release);
+                while (!gate.open.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            }
+        };
+        auto held = std::make_unique<capture>(cleanup);
+        REQUIRE(p.execute([held = std::move(held)]() noexcept {}).has_value());
+        while (cleanup.arrived.load(std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
+
+        const bool idle = p.wait_for(0ns);
+        cleanup.release();
+        p.wait();
+
+        CHECK_FALSE(idle);
+    }
+
+    TEST_CASE("wait_publishes_task_writes") {
+        pool p({.threads = 4});
+        for (int repeat = 0; repeat < 64; ++repeat) {
+            std::array<int, 4> answers{};
+            for (std::size_t i = 0; i < answers.size(); ++i) {
+                REQUIRE(p.execute([&, i]() noexcept { answers[i] = 42; }).has_value());
+            }
+
+            p.wait();
+
+            CHECK(answers == std::array{42, 42, 42, 42});
+        }
+    }
+
+    TEST_CASE("concurrent_drain_preserves_queued_work") {
+        tu::deadlock_watchdog watchdog(30s, "concurrent_drain_preserves_queued_work");
+        pool p({.threads = 1});
+        tu::gate gate;
+        gate.block_all(p, 1);
+        std::atomic<int> completed{0};
+        for (int i = 0; i < 512; ++i) {
+            REQUIRE(p.execute([&]() noexcept { completed.fetch_add(1); }).has_value());
+        }
+        std::jthread first([&] { p.shutdown(shutdown_policy::drain); });
+        while (p.running()) {
+            std::this_thread::yield();
+        }
+        std::atomic<int> entering{0};
+        std::vector<std::jthread> callers;
+        for (int i = 0; i < 4; ++i) {
+            callers.emplace_back([&] {
+                entering.fetch_add(1, std::memory_order_release);
+                p.shutdown(shutdown_policy::drain);
+            });
+        }
+        while (entering.load(std::memory_order_acquire) != 4) {
+            std::this_thread::yield();
+        }
+
+        gate.release();
+        callers.clear();
+        first.join();
+
+        CHECK(completed.load() == 512);
+    }
+
     // 优先级
 
     TEST_CASE("priority_single_worker_high_first") {
@@ -786,6 +905,30 @@ TEST_SUITE("concurrent.pool") {
         ts.clear();
         p.wait();
         CHECK(total.load() == producers * each);
+    }
+
+    TEST_CASE("external_submitters_sharing_a_cache_complete_exactly_once") {
+        pool p({.threads = 4});
+        constexpr std::size_t each = 4096;
+        std::vector<std::atomic<int>> visits(4 * each);
+        std::vector<std::jthread> producers;
+        for (std::size_t producer = 0; producer < 4; ++producer) {
+            producers.emplace_back([&, producer] {
+                // 固定分片数允许线程号碰撞; 强制四个存活线程使用同一合法槽位.
+                detail::tls_external_cell = 0;
+                for (std::size_t i = 0; i < each; ++i) {
+                    const std::size_t index = producer * each + i;
+                    if (!p.execute([&, index]() noexcept { visits[index].fetch_add(1); })) {
+                        std::abort();
+                    }
+                }
+            });
+        }
+
+        producers.clear();
+        p.wait();
+
+        CHECK(std::ranges::all_of(visits, [](const auto& count) { return count.load() == 1; }));
     }
 
     // 全局环缺省容量 65536/层, 提交超量后溢出链接管, 任何时刻都不丢任务

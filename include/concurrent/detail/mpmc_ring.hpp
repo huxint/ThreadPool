@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 
 namespace concurrent::detail {
@@ -11,7 +12,7 @@ namespace concurrent::detail {
     /// Vyukov 有界 MPMC 环形队列. 槽类型为指针
     /// 快路径纯无锁; 满/空语义由调用方处理(try_push 返回 false, try_pop 返回 nullptr)
     template <typename T, std::size_t Capacity>
-        requires(std::has_single_bit(Capacity) && std::is_pointer_v<T>)
+        requires(Capacity >= 2 && std::has_single_bit(Capacity) && std::is_pointer_v<T>)
     class mpmc_ring {
         static constexpr std::size_t mask = Capacity - 1;
 
@@ -69,6 +70,45 @@ namespace concurrent::detail {
                 } else {
                     pos = head_.load(std::memory_order_relaxed); // head 落后, 重读
                 }
+            }
+        }
+
+        /// 一次 CAS 领取连续已发布的槽; seq 在读取值后才释放, 生产者不会提前复用.
+        std::size_t try_pop_batch(std::span<T> out) noexcept {
+            const std::size_t limit = out.size() < Capacity ? out.size() : Capacity;
+            if (limit == 0) {
+                return 0;
+            }
+            std::size_t pos = head_.load(std::memory_order_relaxed);
+            for (;;) {
+                std::size_t count = 0;
+                std::intptr_t dif = 0;
+                for (; count < limit; ++count) {
+                    const auto slot = pos + count;
+                    const auto seq = cells_[slot & mask].seq.load(std::memory_order_acquire);
+                    dif = seq - (static_cast<std::intptr_t>(slot) + 1);
+                    if (dif != 0) {
+                        break;
+                    }
+                }
+                if (count == 0) {
+                    if (dif < 0) {
+                        return 0;
+                    }
+                    pos = head_.load(std::memory_order_relaxed);
+                    continue;
+                }
+                if (!head_.compare_exchange_weak(pos, pos + count, std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+                    continue;
+                }
+                for (std::size_t i = 0; i < count; ++i) {
+                    cell& c = cells_[(pos + i) & mask];
+                    out[i] = c.value;
+                    c.seq.store(static_cast<std::intptr_t>(pos + i) + Capacity,
+                                std::memory_order_release);
+                }
+                return count;
             }
         }
 
